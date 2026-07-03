@@ -7,14 +7,22 @@ from app.core.errors import bad_request
 from app.providers.base import ImageEditProvider
 from app.providers.mock_image_provider import MockImageProvider
 from app.providers.qwen_image_provider import QwenImageProvider
+from app.providers.registry import ImageProviderPlugin, ImageProviderRegistry
 from app.providers.seedream_image_provider import SeedreamImageProvider
 
 _WORKSPACE_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 class ImageProviderFactory:
-    def __init__(self, config: Settings = settings) -> None:
+    def __init__(
+        self,
+        config: Settings = settings,
+        registry: ImageProviderRegistry | None = None,
+    ) -> None:
         self.config = config
+        self.registry = registry or ImageProviderRegistry()
+        if registry is None:
+            self._register_builtin_plugins()
 
     def create(
         self,
@@ -23,25 +31,98 @@ class ImageProviderFactory:
         workspace_id: str | None = None,
     ) -> ImageEditProvider:
         name = self._resolve_provider_name(provider_name, api_key)
-        if name in {"mock", "local"}:
-            return MockImageProvider()
-        if name == "seedream":
-            resolved_key = self._require_key(
-                api_key,
-                self.config.ark_api_key,
-                "Seedream",
-                "ARK_API_KEY",
-            )
-            return SeedreamImageProvider(
-                api_key=resolved_key,
-                endpoint=self.config.ark_image_endpoint,
-                model_name=self.config.ark_image_model,
-                timeout_seconds=self.config.provider_timeout_seconds,
-                download_limit_bytes=self.config.provider_download_limit_bytes,
-            )
-        if name not in {"qwen", "wan"}:
+        try:
+            plugin = self.registry.get(name)
+        except KeyError:
             raise bad_request(f"Unsupported image provider: {name}")
+        return plugin.build(api_key, workspace_id)
 
+    def register(self, plugin: ImageProviderPlugin) -> None:
+        self.registry.register(plugin)
+
+    def capabilities(self) -> dict[str, Any]:
+        return {
+            "defaultProvider": self.config.image_provider,
+            "actionProviders": self.registry.capabilities(),
+            "qwenConfigured": bool(self.config.dashscope_api_key),
+            "qwenModel": self.config.dashscope_image_model,
+            "wanConfigured": bool(self.config.dashscope_api_key),
+            "wanModel": self.config.dashscope_wan_model,
+            "seedreamConfigured": bool(self.config.ark_api_key),
+            "seedreamModel": self.config.ark_image_model,
+            "workspaceConfigured": bool(
+                self.config.dashscope_workspace_id or self.config.dashscope_endpoint
+            ),
+        }
+
+    def _register_builtin_plugins(self) -> None:
+        self.register(
+            ImageProviderPlugin(
+                plugin_id="qwen",
+                build=lambda api_key, workspace_id: self._create_qwen_provider(
+                    "qwen",
+                    api_key,
+                    workspace_id,
+                ),
+                capability=lambda: self._capability(
+                    "qwen",
+                    "Qwen Image",
+                    self.config.dashscope_image_model,
+                    bool(self.config.dashscope_api_key),
+                    workspace_supported=True,
+                ),
+            )
+        )
+        self.register(
+            ImageProviderPlugin(
+                plugin_id="wan",
+                build=lambda api_key, workspace_id: self._create_qwen_provider(
+                    "wan",
+                    api_key,
+                    workspace_id,
+                ),
+                capability=lambda: self._capability(
+                    "wan",
+                    "Wan Image",
+                    self.config.dashscope_wan_model,
+                    bool(self.config.dashscope_api_key),
+                    workspace_supported=True,
+                ),
+            )
+        )
+        self.register(
+            ImageProviderPlugin(
+                plugin_id="seedream",
+                build=self._create_seedream_provider,
+                capability=lambda: self._capability(
+                    "seedream",
+                    "Seedream",
+                    self.config.ark_image_model,
+                    bool(self.config.ark_api_key),
+                ),
+            )
+        )
+        self.register(
+            ImageProviderPlugin(
+                plugin_id="mock",
+                aliases=("local",),
+                build=lambda _api_key, _workspace_id: MockImageProvider(),
+                capability=lambda: self._capability(
+                    "mock",
+                    "本地模拟",
+                    MockImageProvider.model_name,
+                    True,
+                    requires_api_key=False,
+                ),
+            )
+        )
+
+    def _create_qwen_provider(
+        self,
+        provider_name: str,
+        api_key: str | None,
+        workspace_id: str | None,
+    ) -> ImageEditProvider:
         resolved_key = self._require_key(
             api_key,
             self.config.dashscope_api_key,
@@ -53,58 +134,33 @@ class ImageProviderFactory:
             endpoint=self._resolve_endpoint(workspace_id),
             model_name=(
                 self.config.dashscope_wan_model
-                if name == "wan"
+                if provider_name == "wan"
                 else self.config.dashscope_image_model
             ),
-            provider_name=name,
-            parameter_profile=name,
+            provider_name=provider_name,
+            parameter_profile=provider_name,
             timeout_seconds=self.config.provider_timeout_seconds,
             download_limit_bytes=self.config.provider_download_limit_bytes,
         )
 
-    def capabilities(self) -> dict[str, Any]:
-        action_providers = [
-            self._capability(
-                "qwen",
-                "Qwen Image",
-                self.config.dashscope_image_model,
-                bool(self.config.dashscope_api_key),
-                workspace_supported=True,
-            ),
-            self._capability(
-                "wan",
-                "Wan Image",
-                self.config.dashscope_wan_model,
-                bool(self.config.dashscope_api_key),
-                workspace_supported=True,
-            ),
-            self._capability(
-                "seedream",
-                "Seedream",
-                self.config.ark_image_model,
-                bool(self.config.ark_api_key),
-            ),
-            self._capability(
-                "mock",
-                "本地模拟",
-                MockImageProvider.model_name,
-                True,
-                requires_api_key=False,
-            ),
-        ]
-        return {
-            "defaultProvider": self.config.image_provider,
-            "actionProviders": action_providers,
-            "qwenConfigured": bool(self.config.dashscope_api_key),
-            "qwenModel": self.config.dashscope_image_model,
-            "wanConfigured": bool(self.config.dashscope_api_key),
-            "wanModel": self.config.dashscope_wan_model,
-            "seedreamConfigured": bool(self.config.ark_api_key),
-            "seedreamModel": self.config.ark_image_model,
-            "workspaceConfigured": bool(
-                self.config.dashscope_workspace_id or self.config.dashscope_endpoint
-            ),
-        }
+    def _create_seedream_provider(
+        self,
+        api_key: str | None,
+        _workspace_id: str | None,
+    ) -> ImageEditProvider:
+        resolved_key = self._require_key(
+            api_key,
+            self.config.ark_api_key,
+            "Seedream",
+            "ARK_API_KEY",
+        )
+        return SeedreamImageProvider(
+            api_key=resolved_key,
+            endpoint=self.config.ark_image_endpoint,
+            model_name=self.config.ark_image_model,
+            timeout_seconds=self.config.provider_timeout_seconds,
+            download_limit_bytes=self.config.provider_download_limit_bytes,
+        )
 
     @staticmethod
     def _require_key(
