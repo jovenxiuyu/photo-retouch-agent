@@ -172,13 +172,3 @@ class Database:
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
         )
-
-
-_db: Database | None = None
-
-
-def get_db() -> Database:
-    global _db
-    if _db is None:
-        _db = Database()
-    return _db

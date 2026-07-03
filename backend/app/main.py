@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+from app.bootstrap import build_container
 from app.api.middleware.auth import auth_middleware
 from app.api.middleware.rate_limit import rate_limit_middleware
 from app.api.routes.analyze import router as analyze_router
@@ -12,13 +13,12 @@ from app.api.routes.photos import router as photos_router
 from app.api.routes.retouch import router as retouch_router
 from app.core.config import settings
 from app.core.logging import setup_logging
-from app.services.storage import ensure_data_dirs
 
 
 def create_app(_settings: Settings | None = None) -> FastAPI:
     _settings = _settings or settings
     setup_logging(level=_settings.log_level)
-    ensure_data_dirs(_settings)
+    container = build_container(_settings)
     app = FastAPI(
         title=_settings.app_name,
         version=_settings.app_version,
@@ -26,6 +26,7 @@ def create_app(_settings: Settings | None = None) -> FastAPI:
         redoc_url="/redoc",
     )
     app.state.settings = _settings
+    app.state.container = container
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://127.0.0.1:4173", "http://localhost:4173"],

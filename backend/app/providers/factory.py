@@ -179,6 +179,3 @@ class ImageProviderFactory:
             "https://dashscope.aliyuncs.com/api/v1/services/aigc/"
             "multimodal-generation/generation"
         )
-
-
-provider_factory = ImageProviderFactory()

@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from fastapi import Depends
+from fastapi import Depends, Request
 
 from app.api.application_adapters import (
     RegistryAnalysisCatalog,
@@ -8,28 +8,54 @@ from app.api.application_adapters import (
     StorageAssetReader,
 )
 from app.application.use_cases import AnalyzePhoto, CreateRetouchPlans
-from app.domains.registry import domain_registry
-from app.services.storage import StorageService, storage_service
-from app.services.job_store import JobStore, job_store
+from app.bootstrap import AppContainer
+from app.domains.registry import DomainRegistry
+from app.infrastructure.storage import StorageService
+from app.infrastructure.job_store import JobStore
 from app.services.retouch_service import RetouchService
-from app.providers.factory import ImageProviderFactory, provider_factory
-from app.brains.factory import AgentBrainFactory, agent_brain_factory
+from app.providers.factory import ImageProviderFactory
+from app.brains.factory import AgentBrainFactory
+from app.services.task_queue import TaskQueue
 
 
-def get_storage_service() -> StorageService:
-    return storage_service
+def get_container(request: Request) -> AppContainer:
+    return request.app.state.container
 
 
-def get_job_store() -> JobStore:
-    return job_store
+def get_storage_service(
+    container: Annotated[AppContainer, Depends(get_container)],
+) -> StorageService:
+    return container.storage
 
 
-def get_provider_factory() -> ImageProviderFactory:
-    return provider_factory
+def get_job_store(
+    container: Annotated[AppContainer, Depends(get_container)],
+) -> JobStore:
+    return container.jobs
 
 
-def get_agent_brain_factory() -> AgentBrainFactory:
-    return agent_brain_factory
+def get_provider_factory(
+    container: Annotated[AppContainer, Depends(get_container)],
+) -> ImageProviderFactory:
+    return container.image_providers
+
+
+def get_agent_brain_factory(
+    container: Annotated[AppContainer, Depends(get_container)],
+) -> AgentBrainFactory:
+    return container.brains
+
+
+def get_domain_registry(
+    container: Annotated[AppContainer, Depends(get_container)],
+) -> DomainRegistry:
+    return container.domains
+
+
+def get_task_queue(
+    container: Annotated[AppContainer, Depends(get_container)],
+) -> TaskQueue:
+    return container.task_queue
 
 
 def get_retouch_service(
@@ -41,12 +67,15 @@ def get_retouch_service(
 
 def get_analyze_photo_use_case(
     storage: Annotated[StorageService, Depends(get_storage_service)],
+    domains: Annotated[DomainRegistry, Depends(get_domain_registry)],
 ) -> AnalyzePhoto:
     return AnalyzePhoto(
         assets=StorageAssetReader(storage),
-        analyzers=RegistryAnalysisCatalog(domain_registry),
+        analyzers=RegistryAnalysisCatalog(domains),
     )
 
 
-def get_create_plans_use_case() -> CreateRetouchPlans:
-    return CreateRetouchPlans(RegistryPlanCatalog(domain_registry))
+def get_create_plans_use_case(
+    domains: Annotated[DomainRegistry, Depends(get_domain_registry)],
+) -> CreateRetouchPlans:
+    return CreateRetouchPlans(RegistryPlanCatalog(domains))

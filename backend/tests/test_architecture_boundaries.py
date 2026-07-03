@@ -32,6 +32,7 @@ FORBIDDEN_IMPORT_PREFIXES = {
     "providers": ("app.api", "app.services"),
     "brains": ("app.api", "app.services", "app.providers"),
     "services": ("app.api",),
+    "infrastructure": ("app.api", "app.brains", "app.providers"),
 }
 
 

@@ -202,6 +202,3 @@ class AgentBrainFactory:
             else "dashscope.aliyuncs.com"
         )
         return f"https://{legacy_domain}/compatible-mode/v1/chat/completions"
-
-
-agent_brain_factory = AgentBrainFactory()

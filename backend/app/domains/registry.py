@@ -35,6 +35,3 @@ class DomainRegistry:
         if planner is None:
             raise bad_request(f"Unsupported domain type: {domain_type}")
         return planner
-
-
-domain_registry = DomainRegistry()

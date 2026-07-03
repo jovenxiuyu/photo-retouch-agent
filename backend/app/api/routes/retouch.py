@@ -10,19 +10,19 @@ from app.api.dependencies import (
     get_agent_brain_factory,
     get_provider_factory,
     get_retouch_service,
+    get_task_queue,
 )
 from app.application.use_cases import CreateRetouchPlans
 from app.api.model_selection import require_model_selection
 from app.brains.base import PromptBrain
 from app.brains.factory import AgentBrainFactory
-from app.core.config import settings
 from app.providers.base import ImageEditProvider
 from app.providers.factory import ImageProviderFactory
 from app.schemas.job import CreateRetouchJobRequest, RefineRetouchJobRequest, RetouchJob
 from app.schemas.mappers import analysis_to_domain, plan_to_schema
 from app.schemas.retouch import RetouchPlan, RetouchPlansRequest
 from app.services.retouch_service import RetouchService
-from app.services.task_queue import get_task_queue
+from app.services.task_queue import TaskQueue
 
 router = APIRouter(prefix="/retouch", tags=["retouch"])
 
@@ -90,6 +90,7 @@ def get_retouch_providers(
 async def create_retouch_job(
     request: CreateRetouchJobRequest,
     service: Annotated[RetouchService, Depends(get_retouch_service)],
+    queue: Annotated[TaskQueue, Depends(get_task_queue)],
     image_factory: Annotated[ImageProviderFactory, Depends(get_provider_factory)],
     brain_factory: Annotated[AgentBrainFactory, Depends(get_agent_brain_factory)],
     action_name: Annotated[str | None, Header(alias="X-Action-Provider")] = None,
@@ -130,7 +131,6 @@ async def create_retouch_job(
     async def _execute() -> None:
         await svc.execute_job(job.job_id)
 
-    queue = get_task_queue(max_concurrent=settings.max_concurrent_jobs)
     await queue.enqueue(job.job_id, _execute)
 
     return JSONResponse(
@@ -165,6 +165,7 @@ async def refine_retouch_job(
     job_id: str,
     request: RefineRetouchJobRequest,
     service: Annotated[RetouchService, Depends(get_retouch_service)],
+    queue: Annotated[TaskQueue, Depends(get_task_queue)],
     image_factory: Annotated[ImageProviderFactory, Depends(get_provider_factory)],
     brain_factory: Annotated[AgentBrainFactory, Depends(get_agent_brain_factory)],
     action_name: Annotated[str | None, Header(alias="X-Action-Provider")] = None,
@@ -213,7 +214,6 @@ async def refine_retouch_job(
     async def _execute() -> None:
         await svc.execute_job(job.job_id)
 
-    queue = get_task_queue(max_concurrent=settings.max_concurrent_jobs)
     await queue.enqueue(job.job_id, _execute)
 
     return JSONResponse(
