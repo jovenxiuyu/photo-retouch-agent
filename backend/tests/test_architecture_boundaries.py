@@ -11,6 +11,7 @@ APP_ROOT = Path(__file__).resolve().parents[1] / "app"
 # These rules protect the current package layout while the new physical packages
 # are introduced incrementally. New inner packages are added here as they land.
 FORBIDDEN_IMPORT_PREFIXES = {
+    "domain": ("app",),
     "domains": (
         "app.api",
         "app.services",
@@ -46,6 +47,8 @@ def test_backend_packages_do_not_import_outward_layers(
     violations: list[str] = []
     for path in (APP_ROOT / package_name).rglob("*.py"):
         for imported in _imports(path):
+            if package_name == "domain" and imported.startswith("app.domain"):
+                continue
             if imported.startswith(forbidden):
                 violations.append(
                     f"{path.relative_to(APP_ROOT)} imports {imported}"
@@ -60,4 +63,3 @@ def test_frontend_uses_single_application_entrypoint() -> None:
 
     assert 'src="./js/app.js' in html
     assert 'src="./js/main.js' not in html
-
