@@ -11,6 +11,16 @@ APP_ROOT = Path(__file__).resolve().parents[1] / "app"
 # These rules protect the current package layout while the new physical packages
 # are introduced incrementally. New inner packages are added here as they land.
 FORBIDDEN_IMPORT_PREFIXES = {
+    "application": (
+        "app.api",
+        "app.brains",
+        "app.core",
+        "app.domains",
+        "app.infrastructure",
+        "app.providers",
+        "app.schemas",
+        "app.services",
+    ),
     "domain": ("app",),
     "domains": (
         "app.api",

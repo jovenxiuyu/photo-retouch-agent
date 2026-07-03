@@ -6,18 +6,20 @@ from fastapi import APIRouter, Depends, Header
 from fastapi.responses import JSONResponse
 
 from app.api.dependencies import (
+    get_create_plans_use_case,
     get_agent_brain_factory,
     get_provider_factory,
     get_retouch_service,
 )
+from app.application.use_cases import CreateRetouchPlans
 from app.api.model_selection import require_model_selection
 from app.brains.base import PromptBrain
 from app.brains.factory import AgentBrainFactory
 from app.core.config import settings
-from app.domains.registry import domain_registry
 from app.providers.base import ImageEditProvider
 from app.providers.factory import ImageProviderFactory
 from app.schemas.job import CreateRetouchJobRequest, RefineRetouchJobRequest, RetouchJob
+from app.schemas.mappers import analysis_to_domain, plan_to_schema
 from app.schemas.retouch import RetouchPlan, RetouchPlansRequest
 from app.services.retouch_service import RetouchService
 from app.services.task_queue import get_task_queue
@@ -62,9 +64,15 @@ def _create_workflow_models(
 
 
 @router.post("/plans", response_model=list[RetouchPlan], response_model_by_alias=True)
-def create_retouch_plans(request: RetouchPlansRequest) -> list[RetouchPlan]:
-    planner = domain_registry.get_planner(request.analysis.domain_type)
-    return planner.create_plans(request.analysis)
+def create_retouch_plans(
+    request: RetouchPlansRequest,
+    use_case: Annotated[
+        CreateRetouchPlans,
+        Depends(get_create_plans_use_case),
+    ],
+) -> list[RetouchPlan]:
+    plans = use_case.execute(analysis_to_domain(request.analysis))
+    return [plan_to_schema(plan) for plan in plans]
 
 
 @router.get("/providers")
