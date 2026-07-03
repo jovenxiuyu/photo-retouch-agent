@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from app.application.ports import JobDispatcher
 from app.brains.factory import AgentBrainFactory
 from app.core.config import Settings
 from app.domains.registry import DomainRegistry
@@ -9,6 +10,7 @@ from app.infrastructure.job_store import JobStore
 from app.infrastructure.storage import StorageService
 from app.providers.factory import ImageProviderFactory
 from app.services.task_queue import TaskQueue
+from app.worker.in_process import InProcessJobDispatcher
 
 
 @dataclass
@@ -20,9 +22,11 @@ class AppContainer:
     brains: AgentBrainFactory
     domains: DomainRegistry
     task_queue: TaskQueue
+    job_dispatcher: JobDispatcher
 
 
 def build_container(settings: Settings) -> AppContainer:
+    task_queue = TaskQueue(max_concurrent=settings.max_concurrent_jobs)
     return AppContainer(
         settings=settings,
         storage=StorageService(settings),
@@ -30,6 +34,6 @@ def build_container(settings: Settings) -> AppContainer:
         image_providers=ImageProviderFactory(settings),
         brains=AgentBrainFactory(settings),
         domains=DomainRegistry(),
-        task_queue=TaskQueue(max_concurrent=settings.max_concurrent_jobs),
+        task_queue=task_queue,
+        job_dispatcher=InProcessJobDispatcher(task_queue),
     )
-

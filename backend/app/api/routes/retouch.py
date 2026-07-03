@@ -8,10 +8,11 @@ from fastapi.responses import JSONResponse
 from app.api.dependencies import (
     get_create_plans_use_case,
     get_agent_brain_factory,
+    get_job_dispatcher,
     get_provider_factory,
     get_retouch_service,
-    get_task_queue,
 )
+from app.application.ports import JobDispatcher
 from app.application.use_cases import CreateRetouchPlans
 from app.api.model_selection import require_model_selection
 from app.brains.base import PromptBrain
@@ -22,7 +23,6 @@ from app.schemas.job import CreateRetouchJobRequest, RefineRetouchJobRequest, Re
 from app.schemas.mappers import analysis_to_domain, plan_to_schema
 from app.schemas.retouch import RetouchPlan, RetouchPlansRequest
 from app.services.retouch_service import RetouchService
-from app.services.task_queue import TaskQueue
 
 router = APIRouter(prefix="/retouch", tags=["retouch"])
 
@@ -90,7 +90,7 @@ def get_retouch_providers(
 async def create_retouch_job(
     request: CreateRetouchJobRequest,
     service: Annotated[RetouchService, Depends(get_retouch_service)],
-    queue: Annotated[TaskQueue, Depends(get_task_queue)],
+    dispatcher: Annotated[JobDispatcher, Depends(get_job_dispatcher)],
     image_factory: Annotated[ImageProviderFactory, Depends(get_provider_factory)],
     brain_factory: Annotated[AgentBrainFactory, Depends(get_agent_brain_factory)],
     action_name: Annotated[str | None, Header(alias="X-Action-Provider")] = None,
@@ -128,10 +128,7 @@ async def create_retouch_job(
 
     job = await svc.create_job_queued(request)
 
-    async def _execute() -> None:
-        await svc.execute_job(job.job_id)
-
-    await queue.enqueue(job.job_id, _execute)
+    await dispatcher.dispatch(job.job_id, svc.execute_job)
 
     return JSONResponse(
         status_code=202,
@@ -165,7 +162,7 @@ async def refine_retouch_job(
     job_id: str,
     request: RefineRetouchJobRequest,
     service: Annotated[RetouchService, Depends(get_retouch_service)],
-    queue: Annotated[TaskQueue, Depends(get_task_queue)],
+    dispatcher: Annotated[JobDispatcher, Depends(get_job_dispatcher)],
     image_factory: Annotated[ImageProviderFactory, Depends(get_provider_factory)],
     brain_factory: Annotated[AgentBrainFactory, Depends(get_agent_brain_factory)],
     action_name: Annotated[str | None, Header(alias="X-Action-Provider")] = None,
@@ -211,10 +208,7 @@ async def refine_retouch_job(
     )
     job = await svc.create_job_queued(create_req)
 
-    async def _execute() -> None:
-        await svc.execute_job(job.job_id)
-
-    await queue.enqueue(job.job_id, _execute)
+    await dispatcher.dispatch(job.job_id, svc.execute_job)
 
     return JSONResponse(
         status_code=202,

@@ -8,6 +8,7 @@ from app.api.application_adapters import (
     StorageAssetReader,
 )
 from app.application.use_cases import AnalyzePhoto, CreateRetouchPlans
+from app.application.ports import JobDispatcher
 from app.bootstrap import AppContainer
 from app.domains.registry import DomainRegistry
 from app.infrastructure.storage import StorageService
@@ -56,6 +57,12 @@ def get_task_queue(
     container: Annotated[AppContainer, Depends(get_container)],
 ) -> TaskQueue:
     return container.task_queue
+
+
+def get_job_dispatcher(
+    container: Annotated[AppContainer, Depends(get_container)],
+) -> JobDispatcher:
+    return container.job_dispatcher
 
 
 def get_retouch_service(

@@ -25,5 +25,6 @@ def test_build_container_creates_isolated_application_scopes(
     assert first.storage is not second.storage
     assert first.jobs is not second.jobs
     assert first.task_queue is not second.task_queue
+    assert first.job_dispatcher is not second.job_dispatcher
     assert first.storage.config.data_dir == tmp_path / "first"
     assert second.storage.config.data_dir == tmp_path / "second"

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Protocol, Sequence
+from typing import Awaitable, Callable, Protocol, Sequence
 
 from app.domain.analysis import PhotoAnalysis
 from app.domain.retouch import RetouchPlan
@@ -36,3 +36,10 @@ class PlanCatalog(Protocol):
     def create_plans(self, analysis: PhotoAnalysis) -> Sequence[RetouchPlan]:
         """Create retouch plan candidates for a domain analysis."""
 
+
+JobExecutor = Callable[[str], Awaitable[object]]
+
+
+class JobDispatcher(Protocol):
+    async def dispatch(self, job_id: str, executor: JobExecutor) -> None:
+        """Submit a job without coupling callers to the execution transport."""
