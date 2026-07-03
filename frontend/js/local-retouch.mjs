@@ -1,5 +1,16 @@
-const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
-const amount = (values, key) => clamp(Number(values[key]) || 0, 0, 100);
+import { createCanvas } from "./engine/core/canvas.mjs";
+import { drawFilteredRegion } from "./engine/core/filtering.mjs";
+import {
+  adjustmentAmount as amount,
+  clamp,
+} from "./engine/core/math.mjs";
+import {
+  drawCurrentWarp,
+  drawTransformedRegion,
+  mapWarpPosition,
+} from "./engine/geometry/warp.mjs";
+
+export { mapWarpPosition };
 
 export function createRenderRecipe(values = {}) {
   const brightness =
@@ -129,202 +140,6 @@ export function buildCanvasFilter(recipe) {
 
 export function activeAdjustmentCount(values = {}) {
   return Object.values(values).filter((value) => Number(value) > 0).length;
-}
-
-function createCanvas(width, height) {
-  const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
-  return canvas;
-}
-
-export function mapWarpPosition(position, scale) {
-  const normalized = clamp(position, 0, 1) * 2 - 1;
-  const warped =
-    normalized *
-    (scale + (1 - scale) * normalized * normalized);
-  return (warped + 1) / 2;
-}
-
-function drawAxisWarp(context, source, region, scale, axis) {
-  const horizontal = axis === "x";
-  const dimension = horizontal ? region.width : region.height;
-  const sliceCount = clamp(Math.ceil(dimension / 6), 48, 96);
-
-  for (let index = 0; index < sliceCount; index += 1) {
-    const start = index / sliceCount;
-    const end = (index + 1) / sliceCount;
-    const sourceStart =
-      (horizontal ? region.x : region.y) + dimension * start;
-    const sourceEnd =
-      (horizontal ? region.x : region.y) + dimension * end;
-    const destinationStart =
-      (horizontal ? region.x : region.y) +
-      dimension * mapWarpPosition(start, scale);
-    const destinationEnd =
-      (horizontal ? region.x : region.y) +
-      dimension * mapWarpPosition(end, scale);
-
-    if (horizontal) {
-      context.drawImage(
-        source,
-        sourceStart,
-        region.y,
-        sourceEnd - sourceStart,
-        region.height,
-        destinationStart,
-        region.y,
-        destinationEnd - destinationStart + 0.6,
-        region.height,
-      );
-    } else {
-      context.drawImage(
-        source,
-        region.x,
-        sourceStart,
-        region.width,
-        sourceEnd - sourceStart,
-        region.x,
-        destinationStart,
-        region.width,
-        destinationEnd - destinationStart + 0.6,
-      );
-    }
-  }
-}
-
-function applyFeatherMask(
-  canvas,
-  region,
-  featherStart = 0.82,
-  opacity = 1,
-) {
-  const context = canvas.getContext("2d");
-  const radiusX = region.width / 2;
-  const radiusY = region.height / 2;
-
-  context.save();
-  context.globalCompositeOperation = "destination-in";
-  context.translate(region.x + radiusX, region.y + radiusY);
-  context.scale(radiusX, radiusY);
-  const gradient = context.createRadialGradient(0, 0, 0, 0, 0, 1);
-  gradient.addColorStop(0, `rgba(0, 0, 0, ${opacity})`);
-  gradient.addColorStop(
-    featherStart,
-    `rgba(0, 0, 0, ${opacity})`,
-  );
-  gradient.addColorStop(1, "rgba(0, 0, 0, 0)");
-  context.fillStyle = gradient;
-  context.fillRect(-1, -1, 2, 2);
-  context.restore();
-}
-
-function drawScaledRegion(
-  context,
-  source,
-  region,
-  scaleX,
-  scaleY,
-) {
-  if (Math.abs(scaleX - 1) < 0.001 && Math.abs(scaleY - 1) < 0.001) return;
-
-  let warped = source;
-
-  if (Math.abs(scaleX - 1) >= 0.001) {
-    const horizontalWarp = createCanvas(source.width, source.height);
-    drawAxisWarp(
-      horizontalWarp.getContext("2d"),
-      source,
-      region,
-      scaleX,
-      "x",
-    );
-    warped = horizontalWarp;
-  }
-
-  if (Math.abs(scaleY - 1) >= 0.001) {
-    const verticalWarp = createCanvas(source.width, source.height);
-    drawAxisWarp(
-      verticalWarp.getContext("2d"),
-      warped,
-      region,
-      scaleY,
-      "y",
-    );
-    warped = verticalWarp;
-  }
-
-  applyFeatherMask(warped, region);
-  context.drawImage(warped, 0, 0);
-}
-
-function drawCurrentWarp(context, region, scaleX, scaleY) {
-  if (Math.abs(scaleX - 1) < 0.001 && Math.abs(scaleY - 1) < 0.001) return;
-
-  const snapshot = createCanvas(context.canvas.width, context.canvas.height);
-  snapshot.getContext("2d").drawImage(context.canvas, 0, 0);
-  drawScaledRegion(context, snapshot, region, scaleX, scaleY);
-}
-
-function drawFilteredRegion(
-  context,
-  source,
-  region,
-  filter,
-  opacity,
-  featherStart = 0.68,
-) {
-  if (opacity <= 0) return;
-
-  const filtered = createCanvas(source.width, source.height);
-  const filteredContext = filtered.getContext("2d");
-  filteredContext.filter = filter;
-  filteredContext.drawImage(source, 0, 0);
-  applyFeatherMask(filtered, region, featherStart, opacity);
-  context.drawImage(filtered, 0, 0);
-}
-
-function drawTransformedRegion(
-  context,
-  source,
-  region,
-  {
-    scaleX = 1,
-    scaleY = 1,
-    rotation = 0,
-    opacity = 1,
-  } = {},
-) {
-  if (
-    Math.abs(scaleX - 1) < 0.001 &&
-    Math.abs(scaleY - 1) < 0.001 &&
-    Math.abs(rotation) < 0.001
-  ) {
-    return;
-  }
-
-  const layer = createCanvas(source.width, source.height);
-  const layerContext = layer.getContext("2d");
-  const centerX = region.x + region.width / 2;
-  const centerY = region.y + region.height / 2;
-  layerContext.save();
-  layerContext.translate(centerX, centerY);
-  layerContext.rotate(rotation);
-  layerContext.scale(scaleX, scaleY);
-  layerContext.drawImage(
-    source,
-    region.x,
-    region.y,
-    region.width,
-    region.height,
-    -region.width / 2,
-    -region.height / 2,
-    region.width,
-    region.height,
-  );
-  layerContext.restore();
-  applyFeatherMask(layer, region, 0.62, opacity);
-  context.drawImage(layer, 0, 0);
 }
 
 function drawEyeGlow(context, width, height, recipe) {
