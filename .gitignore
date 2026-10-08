@@ -19,3 +19,15 @@ data/models/
 # generator, not the output. Regenerate with: python -m tools.build_edit_masks
 evidence/*.png
 evidence/**/*.png
+
+# Local edit packages hold a copy of the subject's own photo and the masks
+# derived from it; keep the generator (tools.build_local_edit_package), not the
+# output. Regenerate with: python -m tools.build_local_edit_package --photo <img> --style <id>
+artifacts/
+
+# P2.9 audit: upstream CropAndStitch is GPL-3.0 while this repo is Apache-2.0,
+# so the verbatim upstream source/README dumps stay local-only. Provenance and
+# refetch commands live in evidence/p29-cropandstitch-audit/PROVENANCE.md.
+evidence/p29-cropandstitch-audit/inpaint_cropandstitch.py
+evidence/p29-cropandstitch-audit/upstream-README.md
+evidence/p29-cropandstitch-audit/readme-api.json
