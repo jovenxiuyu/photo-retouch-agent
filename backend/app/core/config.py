@@ -185,6 +185,21 @@ class Settings:
             else None
         )
     )
+    # --- analysis reuse cache --------------------------------------------
+    # ``POST /api/photos/analyze`` is the one paid *vision* call in the design
+    # flow, and the styling planner makes a second one. Re-analysing the same
+    # (image, provider, model) inside this window returns the stored analysis
+    # instead of billing the provider again for an identical result.
+    analysis_cache_ttl_seconds: float = field(
+        default_factory=lambda: float(
+            os.getenv("PHOTO_AGENT_ANALYSIS_CACHE_TTL", "900")
+        )
+    )
+    analysis_cache_max_entries: int = field(
+        default_factory=lambda: int(
+            os.getenv("PHOTO_AGENT_ANALYSIS_CACHE_MAX", "64")
+        )
+    )
 
     @property
     def uploads_dir(self) -> Path:

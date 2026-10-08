@@ -420,11 +420,20 @@ function selectStylingProposal(planId) {
 }
 
 
+function analysisReused() {
+  return state.stylingAnalysis?.analysisReused === true;
+}
+
+
 function updateStylingCostNote() {
   const looks = currentStylingProposals();
   if (!looks.length) return;
   const mode = stylingDesignMode();
-  const cost = estimateStylingCost(looks, { selectedCount: 1, mode });
+  const cost = estimateStylingCost(looks, {
+    selectedCount: 1,
+    mode,
+    analysisReused: analysisReused(),
+  });
   const selected = selectedStylingProposal();
   elements.stylingCostNote.textContent = selected
     ? `已选「${selected.name || selected.planId}」：${cost.note} 未点击生成前不会产生任何请求。`
@@ -514,7 +523,7 @@ async function designStylingFlow(mode = "template") {
   const userInstruction = (elements.stylingInstruction?.value || "").trim();
   setStylingBusy(true);
   elements.stylingFeedback.textContent = isAi
-    ? "正在调用 AI 分析人物视觉特征并个性化设计三套造型（预计 1 次模型调用）。"
+    ? "正在调用 AI 设计三套造型（最多 2 次付费模型调用：1 次人物视觉分析 + 1 次造型设计；已有可用分析缓存时只计 1 次）。"
     : "正在使用免费模板组合生成三套造型预览（0 次模型调用，不产生任何费用）。";
   elements.stylingFeedback.className = "ai-feedback";
 
@@ -534,7 +543,11 @@ async function designStylingFlow(mode = "template") {
     renderStylingCards(result.proposals);
     selectStylingProposal(state.selectedStylingId);
     elements.stylingFeedback.textContent = isAi
-      ? `AI 个性化设计完成 ${result.proposals.length} 套造型（1 次模型调用），选择一套再生成图片。`
+      ? `AI 个性化设计完成 ${result.proposals.length} 套造型（${
+          result.analysisReused
+            ? "复用已有分析缓存，本次 1 次付费模型调用"
+            : "2 次付费模型调用：1 次人物视觉分析 + 1 次造型设计"
+        }），选择一套再生成图片。`
       : `已生成 ${result.proposals.length} 套免费模板预览（0 次模型调用），选择一套再生成图片。`;
     elements.stylingFeedback.className = "ai-feedback success";
   } catch (error) {
@@ -683,9 +696,11 @@ async function loadStylingVocabulary() {
       { selectedCount: 1, mode: "ai" },
     );
     if (elements.stylingCostNote) {
-      const aiRequests = Number(info.stylingAiDesignRequests ?? cost.designRequests) || 1;
+      const flowRequests = Number(info.stylingAiFlowRequests ?? cost.paidDesignRequests) || 2;
+      const designRequests =
+        Number(info.stylingAiDesignRequests ?? cost.designRequests) || 1;
       elements.stylingCostNote.textContent =
-        `AI 个性化设计：1 次模型调用（约 ${aiRequests} 次付费请求，一次性生成三套方案）；免费模板预览 0 次调用。出图只对选中的一套发起 ${cost.requestsPerLook} 次图像编辑请求。`;
+        `AI 个性化设计：含 1 次人物视觉分析 + 1 次造型设计，共 ${flowRequests} 次付费模型调用；该照片已有有效分析缓存时复用分析，只计 ${designRequests} 次。免费模板预览 0 次调用。出图只对选中的一套发起 ${cost.requestsPerLook} 次图像编辑请求。`;
     }
   } catch (error) {
     elements.stylingSource.textContent = "风格库状态读取失败";

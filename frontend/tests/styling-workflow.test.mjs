@@ -82,17 +82,40 @@ test("estimateStylingCost reports requests and the free design phase", () => {
   assert.equal(two.totalRequests, 2);
 });
 
-test("estimateStylingCost separates free template preview from the one-call AI design", () => {
+test("estimateStylingCost separates free template preview from the AI design flow", () => {
   const template = estimateStylingCost(THREE_LOOKS, { selectedCount: 1, mode: "template" });
   assert.equal(template.designMode, "template");
+  assert.equal(template.analysisRequests, 0);
   assert.equal(template.designRequests, 0);
+  assert.equal(template.paidDesignRequests, 0);
   assert.match(template.note, /免费生成/);
 
   const ai = estimateStylingCost(THREE_LOOKS, { selectedCount: 1, mode: "ai" });
   assert.equal(ai.designMode, "ai");
+  assert.equal(ai.analysisRequests, 1);
   assert.equal(ai.designRequests, 1);
-  assert.match(ai.note, /1 次模型调用/);
+  // The button triggers two billable vision calls, not one.
+  assert.equal(ai.paidDesignRequests, 2);
+  assert.equal(ai.analysisReused, false);
+  assert.match(ai.note, /2 次付费模型调用/);
+  assert.match(ai.note, /1 次人物视觉分析/);
+  // Generation cost is tracked separately: one look, one image edit.
   assert.equal(ai.totalRequests, 1);
+});
+
+test("estimateStylingCost counts a reused analysis as free", () => {
+  const ai = estimateStylingCost(THREE_LOOKS, {
+    selectedCount: 1,
+    mode: "ai",
+    analysisReused: true,
+  });
+  assert.equal(ai.analysisReused, true);
+  assert.equal(ai.analysisRequests, 1);
+  assert.equal(ai.designRequests, 1);
+  // The analysis was served from cache, so only the design is billed.
+  assert.equal(ai.paidDesignRequests, 1);
+  assert.match(ai.note, /复用/);
+  assert.match(ai.note, /1 次付费模型调用/);
 });
 
 test("designStyling forwards the design mode and user text, and never mislabels templates as AI", async () => {
@@ -119,6 +142,7 @@ test("designStyling forwards the design mode and user text, and never mislabels 
     api,
   });
   assert.equal(aiResult.mode, "ai");
+  assert.equal(aiResult.analysisReused, false);
   assert.equal(calls[0].mode, "ai");
   assert.equal(calls[0].userInstruction, "想要更干练");
   assert.equal(calls[0].brain.name, "siliconflow");
@@ -133,6 +157,36 @@ test("designStyling forwards the design mode and user text, and never mislabels 
   assert.equal(templateResult.mode, "template");
   assert.equal(calls[1].mode, "template");
   assert.ok(templateResult.proposals.every((look) => look.designMode !== "ai"));
+});
+
+test("designStyling surfaces a cached analysis so the caller can report one paid call", async () => {
+  const api = {
+    async uploadPhoto() {
+      return { imageId: "img_reuse" };
+    },
+    async analyzePhoto() {
+      // The backend serves a cached analysis: no provider call was billed.
+      return { imageId: "img_reuse", domainType: "portrait", analysisReused: true };
+    },
+    async createStylingProposals() {
+      return THREE_LOOKS.map((look) => ({ ...look, designMode: "ai" }));
+    },
+  };
+
+  const result = await designStyling({
+    file: { name: "portrait.png" },
+    brain: { name: "siliconflow", apiKey: "sk-x" },
+    action: { name: "siliconflow" },
+    mode: "ai",
+    api,
+  });
+
+  assert.equal(result.analysisReused, true);
+  const cost = estimateStylingCost(result.proposals, {
+    mode: "ai",
+    analysisReused: result.analysisReused,
+  });
+  assert.equal(cost.paidDesignRequests, 1);
 });
 
 test("designs three looks, then generates only the selected look from the original", async () => {

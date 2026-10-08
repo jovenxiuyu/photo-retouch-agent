@@ -87,3 +87,6 @@ class PhotoAnalysis(BaseModel):
     brain_model: str = Field(default="rule-based-analyzer", alias="brainModel")
     vision_mode: str = Field(default="derived", alias="visionMode")
     face_facts: FaceFacts | None = Field(default=None, alias="faceFacts")
+    #: True when the analysis came from the reuse cache instead of a fresh,
+    #: billable provider call.
+    analysis_reused: bool = Field(default=False, alias="analysisReused")

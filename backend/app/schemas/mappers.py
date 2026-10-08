@@ -116,6 +116,7 @@ def analysis_to_domain(analysis: PhotoAnalysisSchema) -> DomainPhotoAnalysis:
         face_facts=(
             analysis.face_facts.model_dump() if analysis.face_facts else None
         ),
+        analysis_reused=analysis.analysis_reused,
     )
 
 
@@ -143,6 +144,7 @@ def analysis_to_schema(analysis: DomainPhotoAnalysis) -> PhotoAnalysisSchema:
             if analysis.face_facts
             else None
         ),
+        analysis_reused=analysis.analysis_reused,
     )
 
 

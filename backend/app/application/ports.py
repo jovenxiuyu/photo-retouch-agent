@@ -33,6 +33,16 @@ class PromptAnalyzer(Protocol):
         """Enrich a baseline analysis with the selected AI brain."""
 
 
+class AnalysisCache(Protocol):
+    """Stores a finished analysis so a repeat call is not billed twice."""
+
+    def get(self, key: str) -> PhotoAnalysis | None:
+        """Return a still-valid cached analysis, or ``None``."""
+
+    def put(self, key: str, analysis: PhotoAnalysis) -> None:
+        """Store an analysis under ``key``."""
+
+
 class PlanCatalog(Protocol):
     def create_plans(self, analysis: PhotoAnalysis) -> Sequence[RetouchPlan]:
         """Create retouch plan candidates for a domain analysis."""

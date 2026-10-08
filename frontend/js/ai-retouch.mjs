@@ -188,19 +188,39 @@ export function buildStylingInstruction(proposal) {
 
 export function estimateStylingCost(
   proposals,
-  { selectedCount = 1, mode = "template" } = {},
+  { selectedCount = 1, mode = "template", analysisReused = false } = {},
 ) {
   const looks = Array.isArray(proposals) ? proposals : [];
   const isAi = mode === "ai";
   const perLook = Math.max(1, Number(looks[0]?.estimatedPaidRequests) || 1);
   const count = Math.max(1, Math.min(Number(selectedCount) || 1, looks.length || 1));
+
+  // The AI design flow the button triggers is *two* billable vision calls: one
+  // ``POST /photos/analyze`` pass and one ``POST /styling/proposals`` pass.
+  // Reporting a single call under-counted the real cost. When the backend can
+  // reuse an existing analysis for the same photo and model, the analysis call
+  // is free, so the honest estimate drops to one paid request.
+  const analysisRequests = isAi ? 1 : 0;
   const designRequests = isAi ? 1 : 0;
+  const reused = isAi && analysisReused === true;
+  const paidDesignRequests = isAi
+    ? reused
+      ? designRequests
+      : analysisRequests + designRequests
+    : 0;
+
   const designNote = isAi
-    ? "AI 个性化设计：点击后一次性生成三套方案，预计 1 次模型调用（1 次付费请求）。"
+    ? reused
+      ? "AI 个性化设计：已复用该照片的有效分析缓存（分析 0 次调用），本次只发起 1 次造型设计调用，共 1 次付费模型调用。"
+      : "AI 个性化设计：本流程含 1 次人物视觉分析 + 1 次造型设计，共 2 次付费模型调用，点击后一次性生成三套方案。"
     : "免费模板预览：0 次模型调用，免费生成，不产生任何费用。";
+
   return {
     designMode: isAi ? "ai" : "template",
+    analysisRequests,
     designRequests,
+    analysisReused: reused,
+    paidDesignRequests,
     selectedCount: count,
     requestsPerLook: perLook,
     totalRequests: perLook * count,
@@ -223,7 +243,9 @@ export async function designStyling({
   const proposals = normalizeStylingProposals(
     await api.createStylingProposals(analysis, { mode, brain, userInstruction }),
   );
-  return { photo, analysis, proposals, mode };
+  // The backend flags a cached analysis so the caller can report the real
+  // number of paid calls (one analysis + one design, or just the design).
+  return { photo, analysis, proposals, mode, analysisReused: analysis?.analysisReused === true };
 }
 
 function stylingJobFailure(job, fallback) {

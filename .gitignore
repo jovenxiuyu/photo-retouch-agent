@@ -14,3 +14,7 @@ data/inputs/
 data/recovery/
 data/models/
 .idea/
+
+# Rendered mask previews may contain the subject's private photo -- keep the
+# generator, not the output. Regenerate with: python -m tools.build_edit_masks
+evidence/*.png

@@ -13,7 +13,7 @@ from app.application.use_cases import (
     CreateRetouchPlans,
     CreateStylingProposals,
 )
-from app.application.ports import JobDispatcher
+from app.application.ports import AnalysisCache, JobDispatcher
 from app.bootstrap import AppContainer
 from app.domains.registry import DomainRegistry
 from app.infrastructure.storage import StorageService
@@ -78,13 +78,21 @@ def get_retouch_service(
     return RetouchService(storage, jobs, settings=container.settings)
 
 
+def get_analysis_cache(
+    container: Annotated[AppContainer, Depends(get_container)],
+) -> AnalysisCache:
+    return container.analysis_cache
+
+
 def get_analyze_photo_use_case(
     storage: Annotated[StorageService, Depends(get_storage_service)],
     domains: Annotated[DomainRegistry, Depends(get_domain_registry)],
+    cache: Annotated[AnalysisCache, Depends(get_analysis_cache)],
 ) -> AnalyzePhoto:
     return AnalyzePhoto(
         assets=StorageAssetReader(storage),
         analyzers=RegistryAnalysisCatalog(domains),
+        cache=cache,
     )
 
 

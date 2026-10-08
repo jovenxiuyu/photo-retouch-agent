@@ -5,10 +5,16 @@ There are two clearly separated design modes:
 * ``template`` -- the free, deterministic ``_Axis`` composition. Zero model
   calls, zero cost.
 * ``ai`` -- a real vision model *authors* the three looks from the person's
-  observable features plus the stylekit catalogue. This is exactly one paid
-  model request, made only when the caller explicitly asks for it, and it is
-  never triggered as a fallback: if the model fails, the request fails with
-  502 instead of quietly returning templates as if they were AI designs.
+  observable features plus the stylekit catalogue. This is one paid styling
+  request, made only when the caller explicitly asks for it, and it is never
+  triggered as a fallback: if the model fails, the request fails with 502
+  instead of quietly returning templates as if they were AI designs.
+
+The full "AI design three looks" flow the UI runs is *two* billable vision
+calls: ``POST /photos/analyze`` first, then ``POST /styling/proposals``. The
+providers endpoint reports that honestly so the copy cannot under-count the
+cost; when the analysis cache still holds the same photo analysed by the same
+model, the first call is served from cache and the flow costs one request.
 
 Generating a look still goes through ``POST /api/retouch/jobs`` with the chosen
 proposal posted as the plan and the *original* image id as ``sourceImageId``.
@@ -60,6 +66,13 @@ _REQUESTS_PER_GENERATION = 1
 # single model call, so the AI design pass costs one request, not three.
 _AI_DESIGN_REQUESTS = 1
 
+# The end-to-end "AI design three looks" flow the UI triggers also runs one
+# billable vision analysis first (``POST /photos/analyze``). Both calls are
+# real provider calls, so the UI must report ``2`` rather than the misleading
+# ``1`` that only counted the planner.
+_AI_ANALYSIS_REQUESTS = 1
+_AI_FLOW_REQUESTS = _AI_ANALYSIS_REQUESTS + _AI_DESIGN_REQUESTS
+
 
 @router.get("/providers")
 def get_styling_providers(
@@ -88,21 +101,31 @@ def get_styling_providers(
                 "id": _AI_MODE,
                 "label": "AI 个性化设计",
                 "isAi": True,
-                "paidRequests": _AI_DESIGN_REQUESTS,
+                "analysisRequests": _AI_ANALYSIS_REQUESTS,
+                "designRequests": _AI_DESIGN_REQUESTS,
+                "paidRequests": _AI_FLOW_REQUESTS,
+                "reusedAnalysisRequests": _AI_DESIGN_REQUESTS,
                 "costNote": (
-                    f"由所选视觉模型一次生成三套方案，预计 {_AI_DESIGN_REQUESTS} 次"
-                    "模型调用，只在你点击按钮时发起。"
+                    "由所选视觉模型设计三套方案：本流程含 1 次人物视觉分析 + "
+                    f"1 次造型设计，共 {_AI_FLOW_REQUESTS} 次付费模型调用，只在"
+                    "你点击按钮时发起。若该照片已有同一模型的有效分析缓存，"
+                    f"分析会免费复用，本次只计 {_AI_DESIGN_REQUESTS} 次。"
                 ),
             },
         },
         "stylingAiDesignRequests": _AI_DESIGN_REQUESTS,
+        "stylingAiAnalysisRequests": _AI_ANALYSIS_REQUESTS,
+        "stylingAiFlowRequests": _AI_FLOW_REQUESTS,
         "estimatedRequestsPerGeneration": _REQUESTS_PER_GENERATION,
         "billingNote": (
-            "Template proposals are free (no model calls); AI styling design uses "
-            f"{_AI_DESIGN_REQUESTS} model request and only runs when you press the "
-            "design button. Generating one look costs "
-            f"{_REQUESTS_PER_GENERATION} image-edit request and only runs when "
-            "you press a generate button."
+            "Template proposals are free (no model calls). The AI design flow is "
+            f"two paid vision calls: 1 analysis (POST /photos/analyze) + 1 styling "
+            f"design (POST /styling/proposals) = {_AI_FLOW_REQUESTS} requests, and "
+            "only runs when you press the design button. A valid cached analysis "
+            "for the same photo and model is reused for free, dropping the flow to "
+            f"{_AI_DESIGN_REQUESTS} request. Generating one look costs "
+            f"{_REQUESTS_PER_GENERATION} image-edit request and only runs when you "
+            "press a generate button."
         ),
     }
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from app.application.ports import (
@@ -48,6 +49,28 @@ class RegistryAnalysisCatalog(AnalysisCatalog):
 class BrainPromptAnalyzer(PromptAnalyzer):
     def __init__(self, brain: PromptBrain) -> None:
         self._brain = brain
+
+    @property
+    def cache_identity(self) -> str | None:
+        """Identity of the model that produced the analysis.
+
+        Used as the analysis-cache discriminator so switching providers (or
+        keys) can never reuse another model's result. The key itself is only
+        ever hashed, never stored or logged.
+        """
+
+        provider = getattr(self._brain, "provider_name", None)
+        model = getattr(self._brain, "model_name", None)
+        vision = getattr(self._brain, "vision_mode", None)
+        if not provider or not model:
+            return None
+        api_key = getattr(self._brain, "_api_key", "") or ""
+        fingerprint = (
+            hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
+            if api_key
+            else "no-key"
+        )
+        return f"{provider}:{model}:{vision}:{fingerprint}"
 
     async def enrich(
         self,
