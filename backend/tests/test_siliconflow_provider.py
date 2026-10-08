@@ -52,6 +52,10 @@ def _settings(tmp_path: Path, **overrides: object) -> Settings:
         "zhipu_api_key": None,
         "deepseek_api_key": None,
         "siliconflow_api_key": None,
+        # These suites drive the provider/job plumbing with synthetic imagery that
+        # has no real face; the strict identity lock is exercised separately in
+        # tests/test_face_lock.py with an injected stub detector.
+        "face_lock_mode": "off",
         "rate_limit_per_second": 0,
     }
     values.update(overrides)

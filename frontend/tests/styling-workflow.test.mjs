@@ -275,3 +275,70 @@ test("refineStyling requires an instruction", async () => {
   );
   await assert.rejects(refineStyling({ api: {} }), /先生成一套造型/);
 });
+
+test("a styling job that fails the strict face lock is reported as an identity failure", async () => {
+  const api = {
+    async createJob() {
+      return { jobId: "job_locked", status: "queued" };
+    },
+    async getJob() {
+      return {
+        jobId: "job_locked",
+        status: "failed",
+        outputUrls: [],
+        errorMessage: "保脸失败（alignment_failed）：…",
+        faceLock: {
+          status: "alignment_failed",
+          applied: false,
+          ok: false,
+          message: "Face rotation differs by 12.0deg (limit 8.0deg).",
+          diagnostics: { mode: "strict" },
+        },
+      };
+    },
+  };
+
+  await assert.rejects(
+    executeStyling({
+      photo: { imageId: "img_original" },
+      proposals: THREE_LOOKS,
+      selectedId: "urban_short",
+      brain: { name: "local" },
+      action: { name: "mock" },
+      api,
+    }),
+    (error) => {
+      // The failure carries the face-lock report so the UI never presents a
+      // failed identity lock as a successful styling.
+      assert.equal(error.faceLock.ok, false);
+      assert.equal(error.faceLock.status, "alignment_failed");
+      assert.equal(error.jobStatus, "failed");
+      return true;
+    },
+  );
+});
+
+test("a successful styling job keeps face-lock mode available to the UI", async () => {
+  const api = {
+    async createJob() {
+      return {
+        jobId: "job_ok",
+        status: "succeeded",
+        outputUrls: ["/data/outputs/locked.png"],
+        faceLock: { status: "applied", applied: true, ok: true, diagnostics: { mode: "strict" } },
+      };
+    },
+  };
+
+  const result = await executeStyling({
+    photo: { imageId: "img_original" },
+    proposals: THREE_LOOKS,
+    selectedId: "urban_short",
+    brain: { name: "local" },
+    action: { name: "mock" },
+    api,
+  });
+
+  assert.equal(result.job.faceLock.ok, true);
+  assert.equal(result.job.outputUrls[0], "/data/outputs/locked.png");
+});

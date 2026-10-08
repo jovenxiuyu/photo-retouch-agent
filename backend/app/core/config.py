@@ -152,6 +152,39 @@ class Settings:
             "SILICONFLOW_IMAGE_MODEL", "Qwen/Qwen-Image-Edit-2509"
         ).strip()
     )
+    # --- strict face identity lock ---------------------------------------
+    # The styling providers repaint the whole person, so the generated face is
+    # *not* trustworthy even when the prompt begs for identity preservation.
+    # ``strict`` restores the original facial pixels after generation; ``off``
+    # keeps the raw provider output (unlocked) for debugging only.
+    face_lock_mode: str = field(
+        default_factory=lambda: os.getenv(
+            "PHOTO_AGENT_FACE_LOCK_MODE", "strict"
+        ).strip().lower()
+    )
+    face_landmark_model_path: Path = field(
+        default_factory=lambda: Path(
+            os.getenv("PHOTO_AGENT_FACE_LANDMARK_MODEL")
+            or str(PROJECT_ROOT / "data" / "models" / "face_landmarker.task")
+        )
+    )
+    face_lock_residual_ratio: float = field(
+        default_factory=lambda: float(
+            os.getenv("PHOTO_AGENT_FACE_LOCK_RESIDUAL_RATIO", "0.045")
+        )
+    )
+    face_lock_strict_residual_ratio: float = field(
+        default_factory=lambda: float(
+            os.getenv("PHOTO_AGENT_FACE_LOCK_STRICT_RESIDUAL_RATIO", "0.030")
+        )
+    )
+    face_lock_manual_mask_path: Path | None = field(
+        default_factory=lambda: (
+            Path(value)
+            if (value := _optional_env("PHOTO_AGENT_FACE_LOCK_MASK"))
+            else None
+        )
+    )
 
     @property
     def uploads_dir(self) -> Path:
@@ -164,6 +197,14 @@ class Settings:
     @property
     def jobs_dir(self) -> Path:
         return self.data_dir / "jobs"
+
+    @property
+    def models_dir(self) -> Path:
+        return self.data_dir / "models"
+
+    @property
+    def face_lock_enabled(self) -> bool:
+        return self.face_lock_mode not in ("", "off", "none", "disabled")
 
 
 settings = Settings()

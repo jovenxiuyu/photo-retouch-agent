@@ -226,12 +226,22 @@ export async function designStyling({
   return { photo, analysis, proposals, mode };
 }
 
+function stylingJobFailure(job, fallback) {
+  const error = new Error(job?.errorMessage || fallback);
+  // Carry the strict face-lock report (when present) so the UI can tell an
+  // identity-preservation failure apart from any other job failure instead of
+  // silently presenting it as a successful styling.
+  error.faceLock = job?.faceLock || null;
+  error.jobStatus = job?.status || "failed";
+  return error;
+}
+
 async function resolveStylingJob(api, created) {
   if (created?.status === "succeeded" && created.outputUrls?.length) {
     return created;
   }
   if (created?.status === "failed") {
-    throw new Error(created.errorMessage || "AI 造型任务生成失败。");
+    throw stylingJobFailure(created, "AI 造型任务生成失败。");
   }
   if (!created?.jobId || typeof api.getJob !== "function") {
     throw new Error(created?.errorMessage || "AI 造型任务未生成结果。");
@@ -245,7 +255,7 @@ async function resolveStylingJob(api, created) {
     delay = Math.min(Math.round(delay * 1.5), 5000);
     job = await api.getJob(created.jobId);
     if (job?.status === "failed") {
-      throw new Error(job.errorMessage || "AI 造型任务生成失败。");
+      throw stylingJobFailure(job, "AI 造型任务生成失败。");
     }
     if (job?.status === "succeeded" && job.outputUrls?.length) {
       return job;

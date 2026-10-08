@@ -71,10 +71,11 @@ def get_job_dispatcher(
 
 
 def get_retouch_service(
+    container: Annotated[AppContainer, Depends(get_container)],
     storage: Annotated[StorageService, Depends(get_storage_service)],
     jobs: Annotated[JobStore, Depends(get_job_store)],
 ) -> RetouchService:
-    return RetouchService(storage, jobs)
+    return RetouchService(storage, jobs, settings=container.settings)
 
 
 def get_analyze_photo_use_case(

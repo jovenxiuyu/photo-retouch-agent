@@ -550,6 +550,25 @@ async function designStylingFlow(mode = "template") {
 }
 
 
+function describeFaceLock(faceLock) {
+  if (!faceLock || typeof faceLock.ok !== "boolean") return "";
+  const mode = faceLock.diagnostics?.mode;
+  const suffix = mode ? `（${mode}）` : "";
+  return faceLock.ok
+    ? ` · 严格保脸校验通过${suffix}`
+    : ` · 保脸校验未通过（${faceLock.status}）`;
+}
+
+function describeStylingFailure(error) {
+  const faceLock = error?.faceLock;
+  if (faceLock && faceLock.ok === false) {
+    // The styling pixels may look nice, but the original face could not be
+    // restored with confidence -- report the identity failure honestly.
+    return `保脸失败（${faceLock.status}）：${faceLock.message || "未能把原始五官无痕还原。"} 生成图未通过严格人脸锁定校验，请人工检查保护区域或调整掩膜后重试。`;
+  }
+  return error?.message || "AI 造型生成失败。";
+}
+
 async function generateStyling(planId) {
   if (state.stylingBusy) return;
   const proposal = currentStylingProposals().find((look) => look.planId === planId);
@@ -590,11 +609,12 @@ async function generateStyling(planId) {
     elements.footerStatus.textContent = "造型结果已生成";
     state.generatedStylingJobId = result.job.jobId;
     elements.stylingRefine.hidden = false;
-    elements.stylingFeedback.textContent = `「${result.proposal.name || planId}」生成成功 · ${result.job.modelName || ""}。可继续提出局部修改。`;
+    const lockBadge = describeFaceLock(result.job.faceLock);
+    elements.stylingFeedback.textContent = `「${result.proposal.name || planId}」生成成功 · ${result.job.modelName || ""}${lockBadge}。可继续提出局部修改。`;
     elements.stylingFeedback.className = "ai-feedback success";
   } catch (error) {
     elements.footerStatus.textContent = "AI 造型失败";
-    elements.stylingFeedback.textContent = error.message;
+    elements.stylingFeedback.textContent = describeStylingFailure(error);
     elements.stylingFeedback.className = "ai-feedback error";
   } finally {
     setStylingBusy(false);

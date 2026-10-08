@@ -33,6 +33,10 @@ def temp_settings(tmp_path: Path) -> Settings:
         zhipu_api_key=None,
         ark_api_key=None,
         siliconflow_api_key=None,
+        # Existing suites exercise the provider/job plumbing with synthetic
+        # imagery that has no real face; the strict lock is covered separately
+        # in tests/test_face_lock.py with an injected stub detector.
+        face_lock_mode="off",
         rate_limit_per_second=0,
         max_concurrent_jobs=10,
     )
