@@ -621,6 +621,57 @@ def test_endless_redirect_loop_is_bounded(tmp_path: Path) -> None:
     assert "redirected too many times" in str(error.value)
 
 
+def test_failed_download_parks_the_result_url_for_a_free_retry(tmp_path: Path) -> None:
+    """A failed download stays fatal, but the billed result URL must not be lost."""
+    result_url = "https://images.example.test/result.png?Signature=abc&Expires=1"
+    provider = _editing_provider(
+        _serving_handler(result_url, b"<html>sign-in</html>", "text/html")
+    )
+
+    with pytest.raises(SiliconFlowProviderError) as error:
+        _run_edit(provider, tmp_path, "out_stash.png")
+
+    assert "did not return an image" in str(error.value)
+    # The signed URL stays out of the error message, so it cannot reach job records.
+    assert result_url not in str(error.value)
+    # No half-written picture in the outputs tree.
+    assert not (tmp_path / "outputs" / "out_stash.png").exists()
+
+    parked = tmp_path / "recovery" / "out_stash.url.json"
+    assert parked.is_file()
+    assert parked.stat().st_mode & 0o777 == 0o600
+    payload = json.loads(parked.read_text("utf-8"))
+    assert payload["resultUrl"] == result_url
+    assert payload["model"] == IMAGE_MODEL
+
+
+def test_successful_download_parks_nothing(tmp_path: Path) -> None:
+    provider = _editing_provider(
+        _serving_handler(
+            "https://images.example.test/result.png",
+            make_image_bytes(size=(16, 16)),
+            "image/png",
+        )
+    )
+
+    _run_edit(provider, tmp_path, "out_clean.png")
+
+    assert not (tmp_path / "recovery").exists()
+
+
+def test_unsafe_result_url_is_refused_without_parking_it(tmp_path: Path) -> None:
+    provider = _editing_provider(
+        _serving_handler("http://127.0.0.1:8000/steal.png", b"root:x:0:0", "text/plain")
+    )
+
+    with pytest.raises(SiliconFlowProviderError) as error:
+        _run_edit(provider, tmp_path, "out_unsafe.png")
+
+    assert "non-public address" in str(error.value)
+    # A hostile URL is refused before anything is written anywhere on disk.
+    assert not (tmp_path / "recovery").exists()
+
+
 def test_factory_returns_a_siliconflow_provider_and_keeps_mock_available(
     tmp_path: Path,
 ) -> None:

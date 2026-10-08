@@ -140,3 +140,145 @@ export async function executeAiRetouch({
 
   return { photo, analysis, plans, plan, instruction, job };
 }
+
+const STYLING_POLL_TIMEOUT_MS = 120000;
+
+export function normalizeStylingProposals(proposals) {
+  if (!Array.isArray(proposals) || proposals.length < 3) {
+    throw new Error("AI 造型设计需要三套完整方案。");
+  }
+
+  const looks = proposals.slice(0, 3);
+  const ids = looks.map((look) => look.planId || look.designAxis);
+  if (ids.some((id) => !id) || new Set(ids).size !== ids.length) {
+    throw new Error("造型方案标识重复，无法区分不同设计。");
+  }
+
+  const prompts = looks.map((look) => (look.editPrompt || "").trim());
+  if (prompts.some((prompt) => !prompt)) {
+    throw new Error("每套造型都必须提供独立的图像编辑指令。");
+  }
+  if (new Set(prompts).size !== prompts.length) {
+    throw new Error("三套造型的编辑指令必须各不相同，不能复用同一段 Prompt。");
+  }
+
+  for (const look of looks) {
+    if (!look.hairPlan || !look.makeupPlan || !look.outfitPlan) {
+      throw new Error(`造型「${look.name || look.planId}」缺少发型／妆容／穿搭说明。`);
+    }
+  }
+
+  return looks;
+}
+
+export function buildStylingInstruction(proposal, userInstruction = "") {
+  const parts = [
+    `按「${proposal.name || proposal.title}」造型方案改造本人照片。`,
+    (proposal.editPrompt || "").trim(),
+  ];
+  if (proposal.identityAnchors?.length) {
+    parts.push(`保留本人辨识特征（尽力而为，不保证百分之百）：${proposal.identityAnchors.join("、")}。`);
+  }
+  const extra = (userInstruction || "").trim();
+  if (extra) parts.push(`用户补充要求：${extra}`);
+  return parts.filter(Boolean).join("\n");
+}
+
+export function estimateStylingCost(proposals, { selectedCount = 1 } = {}) {
+  const looks = Array.isArray(proposals) ? proposals : [];
+  const perLook = Math.max(1, Number(looks[0]?.estimatedPaidRequests) || 1);
+  const count = Math.max(1, Math.min(Number(selectedCount) || 1, looks.length || 1));
+  return {
+    selectedCount: count,
+    requestsPerLook: perLook,
+    totalRequests: perLook * count,
+    note: `造型方案免费生成（0 次付费请求）；出图只对选中的 ${count} 套各发起 ${perLook} 次图像编辑请求，合计约 ${perLook * count} 次。`,
+  };
+}
+
+export async function designStyling({ file, brain, action, api }) {
+  if (!file) throw new Error("请先选择一张照片。");
+
+  const photo = await api.uploadPhoto(file);
+  const analysis = await api.analyzePhoto(photo.imageId, brain, action);
+  const proposals = normalizeStylingProposals(
+    await api.createStylingProposals(analysis),
+  );
+  return { photo, analysis, proposals };
+}
+
+async function resolveStylingJob(api, created) {
+  if (created?.status === "succeeded" && created.outputUrls?.length) {
+    return created;
+  }
+  if (created?.status === "failed") {
+    throw new Error(created.errorMessage || "AI 造型任务生成失败。");
+  }
+  if (!created?.jobId || typeof api.getJob !== "function") {
+    throw new Error(created?.errorMessage || "AI 造型任务未生成结果。");
+  }
+
+  const deadline = Date.now() + STYLING_POLL_TIMEOUT_MS;
+  let delay = 600;
+  let job = created;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    delay = Math.min(Math.round(delay * 1.5), 5000);
+    job = await api.getJob(created.jobId);
+    if (job?.status === "failed") {
+      throw new Error(job.errorMessage || "AI 造型任务生成失败。");
+    }
+    if (job?.status === "succeeded" && job.outputUrls?.length) {
+      return job;
+    }
+  }
+  throw new Error("AI 造型生成超时，请稍后重试。");
+}
+
+export async function executeStyling({
+  photo,
+  proposals,
+  selectedId,
+  userInstruction = "",
+  brain,
+  action,
+  api,
+}) {
+  const looks = normalizeStylingProposals(proposals);
+  const proposal = looks.find(
+    (look) => (look.planId || look.designAxis) === selectedId,
+  );
+  if (!proposal) throw new Error("请选择一套要生成的造型。");
+  if (!photo?.imageId) throw new Error("缺少原图，请重新上传照片后再生成。");
+
+  const instruction = buildStylingInstruction(proposal, userInstruction);
+  const plan = {
+    ...proposal,
+    editPrompt: instruction,
+  };
+  const created = await api.createJob(
+    photo.imageId,
+    plan,
+    (userInstruction || "").trim(),
+    brain,
+    action,
+  );
+  const job = await resolveStylingJob(api, created);
+  return { proposal, instruction, job };
+}
+
+export async function refineStyling({
+  jobId,
+  userInstruction,
+  brain,
+  action,
+  api,
+}) {
+  if (!jobId) throw new Error("请先生成一套造型，再进行二次修改。");
+  const instruction = (userInstruction || "").trim();
+  if (!instruction) throw new Error("请填写你的修改要求。");
+
+  const created = await api.refineJob(jobId, instruction, brain, action);
+  const job = await resolveStylingJob(api, created);
+  return { job };
+}

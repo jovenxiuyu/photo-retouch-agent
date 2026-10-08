@@ -5,6 +5,7 @@ from typing import Awaitable, Callable, Protocol, Sequence
 
 from app.domain.analysis import PhotoAnalysis
 from app.domain.retouch import RetouchPlan
+from app.domain.styling import StylingProposal
 
 
 class AssetReader(Protocol):
@@ -35,6 +36,14 @@ class PromptAnalyzer(Protocol):
 class PlanCatalog(Protocol):
     def create_plans(self, analysis: PhotoAnalysis) -> Sequence[RetouchPlan]:
         """Create retouch plan candidates for a domain analysis."""
+
+
+class StylingCatalog(Protocol):
+    def create_styling_proposals(
+        self,
+        analysis: PhotoAnalysis,
+    ) -> Sequence[StylingProposal]:
+        """Design complete looks for the person in a portrait analysis."""
 
 
 JobExecutor = Callable[[str], Awaitable[object]]

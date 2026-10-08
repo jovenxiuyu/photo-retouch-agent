@@ -5,12 +5,21 @@ import {
   assetUrl,
   createJob,
   createPlans,
+  createStylingProposals,
+  getJob,
   getProviderCapabilities,
+  getStylingProviders,
+  refineJob,
   uploadPhoto,
 } from "./api.js";
 
 import {
+  designStyling,
+  estimateStylingCost,
   executeAiRetouch,
+  executeStyling,
+  normalizeStylingProposals,
+  refineStyling,
   validateModelSelection,
 } from "./ai-retouch.mjs";
 
@@ -65,10 +74,26 @@ const elements = {
   brainWorkspaceInput: document.querySelector("#brainWorkspaceInput"),
   actionWorkspaceInput: document.querySelector("#actionWorkspaceInput"),
   documentName: document.querySelector("#documentName"),
+  stylingSource: document.querySelector("#stylingSource"),
+  stylingDesignButton: document.querySelector("#stylingDesignButton"),
+  stylingCostNote: document.querySelector("#stylingCostNote"),
+  stylingGrid: document.querySelector("#stylingGrid"),
+  stylingRefine: document.querySelector("#stylingRefine"),
+  stylingInstruction: document.querySelector("#stylingInstruction"),
+  stylingRefineButton: document.querySelector("#stylingRefineButton"),
+  stylingFeedback: document.querySelector("#stylingFeedback"),
 };
 
 
-const aiApi = { uploadPhoto, analyzePhoto, createPlans, createJob };
+const aiApi = {
+  uploadPhoto,
+  analyzePhoto,
+  createPlans,
+  createJob,
+  createStylingProposals,
+  getJob,
+  refineJob,
+};
 
 
 function populateProviderSelect(select, providers, preferredId) {
@@ -366,6 +391,250 @@ function applyPreset(preset) {
 }
 
 
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+
+function currentStylingProposals() {
+  return Array.isArray(state.stylingProposals) ? state.stylingProposals : [];
+}
+
+
+function selectedStylingProposal() {
+  return currentStylingProposals().find((look) => look.planId === state.selectedStylingId) || null;
+}
+
+
+function selectStylingProposal(planId) {
+  state.selectedStylingId = planId;
+  elements.stylingGrid.querySelectorAll("[data-styling-card]").forEach((card) => {
+    card.classList.toggle("active", card.dataset.stylingCard === planId);
+  });
+  updateStylingCostNote();
+}
+
+
+function updateStylingCostNote() {
+  const looks = currentStylingProposals();
+  if (!looks.length) return;
+  const cost = estimateStylingCost(looks, { selectedCount: 1 });
+  const selected = selectedStylingProposal();
+  elements.stylingCostNote.textContent = selected
+    ? `已选「${selected.name || selected.planId}」：${cost.note} 未点击生成前不会产生任何请求。`
+    : cost.note;
+}
+
+
+function referenceSourceLabel(proposal) {
+  const presets = Array.isArray(proposal.referencePresets) ? proposal.referencePresets : [];
+  if (!presets.length) return "";
+  const source = proposal.stylingVocabularySource || presets[0].sourceFile || "stylekit";
+  return `风格库来源：${source}`;
+}
+
+
+function renderStylingCards(proposals) {
+  const looks = Array.isArray(proposals) && proposals.length ? proposals : currentStylingProposals();
+  elements.stylingGrid.innerHTML = looks
+    .map((look) => {
+      const active = look.planId === state.selectedStylingId;
+      const presets = Array.isArray(look.referencePresets) ? look.referencePresets : [];
+      const presetChips = presets
+        .slice(0, 6)
+        .map((preset) => `<span class="styling-chip">${escapeHtml(preset.nameZh || preset.name || preset.presetId)}</span>`)
+        .join("");
+      return `
+        <article class="styling-card ${active ? "active" : ""}" data-styling-card="${escapeHtml(look.planId)}">
+          <header class="styling-card-head">
+            <strong>${escapeHtml(look.name || look.title)}</strong>
+            <em>${escapeHtml(referenceSourceLabel(look) || "stylekit")}</em>
+          </header>
+          <span class="styling-card-direction">${escapeHtml(look.designDirection || look.designAxis || "")}</span>
+          <dl>
+            <dt>发型</dt><dd>${escapeHtml(look.hairPlan)}</dd>
+            <dt>妆容</dt><dd>${escapeHtml(look.makeupPlan)}</dd>
+            <dt>穿搭</dt><dd>${escapeHtml(look.outfitPlan)}</dd>
+            <dt>配饰</dt><dd>${escapeHtml(look.accessoryPlan || "无")}</dd>
+            <dt>配色</dt><dd>${escapeHtml(look.palette || "")}</dd>
+          </dl>
+          <p class="styling-why">为什么适合当前人物：${escapeHtml(look.whyItFits || look.designReason || "")}</p>
+          ${presetChips ? `<div class="styling-chips">${presetChips}</div>` : ""}
+          <button type="button" data-styling-generate="${escapeHtml(look.planId)}">生成这套造型</button>
+        </article>`;
+    })
+    .join("");
+
+  elements.stylingGrid.querySelectorAll("[data-styling-card]").forEach((card) => {
+    card.addEventListener("click", () => selectStylingProposal(card.dataset.stylingCard));
+  });
+  elements.stylingGrid.querySelectorAll("[data-styling-generate]").forEach((btn) => {
+    btn.addEventListener("click", (event) => {
+      event.stopPropagation();
+      selectStylingProposal(btn.dataset.stylingGenerate);
+      generateStyling(btn.dataset.stylingGenerate);
+    });
+  });
+}
+
+
+async function designStylingFlow() {
+  if (state.stylingBusy) return;
+  state.stylingBusy = true;
+  elements.stylingDesignButton.disabled = true;
+  elements.stylingFeedback.textContent = "正在分析人物特征并设计三套造型（设计方案免费，0 次付费请求）。";
+  elements.stylingFeedback.className = "ai-feedback";
+
+  try {
+    const brain = modelRequest("brain");
+    const action = modelRequest("action");
+    validateModelSelection(state.capabilities, brain, action);
+    const file = await currentSourceFile();
+    const result = await designStyling({ file, brain, action, api: aiApi });
+    state.stylingPhoto = result.photo;
+    state.stylingAnalysis = result.analysis;
+    state.stylingProposals = result.proposals;
+    state.selectedStylingId = result.proposals[0].planId;
+    state.generatedStylingJobId = null;
+    elements.stylingGrid.hidden = false;
+    elements.stylingRefine.hidden = true;
+    renderStylingCards(result.proposals);
+    selectStylingProposal(state.selectedStylingId);
+    elements.stylingFeedback.textContent = `已生成 ${result.proposals.length} 套造型设计，选择一套再生成图片。`;
+    elements.stylingFeedback.className = "ai-feedback success";
+  } catch (error) {
+    elements.stylingFeedback.textContent = error.message;
+    elements.stylingFeedback.className = "ai-feedback error";
+  } finally {
+    state.stylingBusy = false;
+    elements.stylingDesignButton.disabled = false;
+  }
+}
+
+
+async function generateStyling(planId) {
+  if (state.stylingBusy) return;
+  const proposal = currentStylingProposals().find((look) => look.planId === planId);
+  if (!proposal) return;
+  if (!state.stylingPhoto) {
+    elements.stylingFeedback.textContent = "请先让 AI 设计三套造型。";
+    elements.stylingFeedback.className = "ai-feedback error";
+    return;
+  }
+
+  const cost = estimateStylingCost(currentStylingProposals(), { selectedCount: 1 });
+  const userInstruction = (elements.stylingInstruction?.value || "").trim();
+  state.stylingBusy = true;
+  elements.stylingDesignButton.disabled = true;
+  elements.stylingFeedback.textContent = `即将生成「${proposal.name || planId}」：预计 ${cost.totalRequests} 次付费图像编辑请求（￥按服务商计费）。`;
+  elements.stylingFeedback.className = "ai-feedback";
+  elements.footerStatus.textContent = "AI 造型生成中";
+
+  try {
+    const brain = modelRequest("brain");
+    const action = modelRequest("action");
+    const result = await executeStyling({
+      photo: state.stylingPhoto,
+      proposals: currentStylingProposals(),
+      selectedId: planId,
+      userInstruction,
+      brain,
+      action,
+      api: aiApi,
+    });
+    const resultUrl = assetUrl(result.job.outputUrls[0]);
+    state.mode = "ai";
+    await showAiResult(resultUrl);
+    elements.exportButton.href = resultUrl;
+    elements.canvasStatus.innerHTML = `<span></span>造型结果 · ${escapeHtml(result.proposal.name || planId)}`;
+    elements.footerStatus.textContent = "造型结果已生成";
+    state.generatedStylingJobId = result.job.jobId;
+    elements.stylingRefine.hidden = false;
+    elements.stylingFeedback.textContent = `「${result.proposal.name || planId}」生成成功 · ${result.job.modelName || ""}。可继续提出局部修改。`;
+    elements.stylingFeedback.className = "ai-feedback success";
+  } catch (error) {
+    elements.footerStatus.textContent = "AI 造型失败";
+    elements.stylingFeedback.textContent = error.message;
+    elements.stylingFeedback.className = "ai-feedback error";
+  } finally {
+    state.stylingBusy = false;
+    elements.stylingDesignButton.disabled = false;
+  }
+}
+
+
+async function refineStylingFlow() {
+  if (state.stylingBusy) return;
+  const userInstruction = (elements.stylingInstruction?.value || "").trim();
+  if (!state.generatedStylingJobId) {
+    elements.stylingFeedback.textContent = "请先生成一套造型，再进行二次修改。";
+    elements.stylingFeedback.className = "ai-feedback error";
+    return;
+  }
+  if (!userInstruction) {
+    elements.stylingFeedback.textContent = "请填写你的修改要求，例如“头发再短一点”。";
+    elements.stylingFeedback.className = "ai-feedback error";
+    return;
+  }
+
+  state.stylingBusy = true;
+  elements.stylingRefineButton.disabled = true;
+  elements.stylingFeedback.textContent = "即将基于上一版结果发起 1 次付费图像编辑请求。";
+  elements.stylingFeedback.className = "ai-feedback";
+
+  try {
+    const brain = modelRequest("brain");
+    const action = modelRequest("action");
+    const result = await refineStyling({
+      jobId: state.generatedStylingJobId,
+      userInstruction,
+      brain,
+      action,
+      api: aiApi,
+    });
+    const resultUrl = assetUrl(result.job.outputUrls[0]);
+    state.mode = "ai";
+    await showAiResult(resultUrl);
+    elements.exportButton.href = resultUrl;
+    elements.canvasStatus.innerHTML = "<span></span>造型二次修改结果";
+    elements.footerStatus.textContent = "二次修改完成";
+    state.generatedStylingJobId = result.job.jobId;
+    elements.stylingInstruction.value = "";
+    elements.stylingFeedback.textContent = "二次修改已生成，可继续提出下一条要求。";
+    elements.stylingFeedback.className = "ai-feedback success";
+  } catch (error) {
+    elements.stylingFeedback.textContent = error.message;
+    elements.stylingFeedback.className = "ai-feedback error";
+  } finally {
+    state.stylingBusy = false;
+    elements.stylingRefineButton.disabled = false;
+  }
+}
+
+
+async function loadStylingVocabulary() {
+  if (!elements.stylingSource) return;
+  try {
+    const info = await getStylingProviders();
+    const vocab = info.stylingVocabulary || {};
+    const files = Array.isArray(vocab.loadedFiles) ? vocab.loadedFiles.length : 0;
+    elements.stylingSource.textContent = vocab.available
+      ? `风格库已加载 · ${vocab.sourceLabel || "stylekit"} · ${files} 个文件`
+      : "风格库不可用，将使用内置兜底词汇";
+    const cost = estimateStylingCost([{ estimatedPaidRequests: info.estimatedRequestsPerGeneration || 1 }], { selectedCount: 1 });
+    if (elements.stylingCostNote) {
+      elements.stylingCostNote.textContent = `方案设计免费（0 次付费请求）；出图只对选中的一套发起 ${cost.requestsPerLook} 次图像编辑请求。`;
+    }
+  } catch (error) {
+    elements.stylingSource.textContent = "风格库状态读取失败";
+  }
+}
+
+
 function init() {
   document.querySelectorAll("[data-category]").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -453,6 +722,14 @@ function init() {
   elements.actionApiKeyInput.addEventListener("input", syncModelConfig);
   elements.exportButton.addEventListener("click", exportCurrentImage);
 
+  state.stylingProposals = state.stylingProposals || [];
+  state.selectedStylingId = state.selectedStylingId ?? null;
+  state.stylingBusy = false;
+  state.stylingPhoto = state.stylingPhoto || null;
+  state.generatedStylingJobId = state.generatedStylingJobId ?? null;
+  elements.stylingDesignButton.addEventListener("click", designStylingFlow);
+  elements.stylingRefineButton.addEventListener("click", refineStylingFlow);
+
   elements.generateButton.addEventListener("click", async () => {
     if (state.aiBusy) return;
     const label = elements.generateButton.querySelector("b");
@@ -503,6 +780,7 @@ function init() {
   elements.compareRange.dispatchEvent(new Event("input"));
   if (elements.beforeImage.complete && elements.beforeImage.naturalWidth) scheduleLocalRender();
   loadProviderCapabilities();
+  loadStylingVocabulary();
 }
 
 init();

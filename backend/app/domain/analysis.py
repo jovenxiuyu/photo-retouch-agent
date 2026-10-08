@@ -29,10 +29,10 @@ class PhotoAnalysis:
     brain_provider: str = "local"
     brain_model: str = "rule-based-analyzer"
     vision_mode: str = "derived"
+    face_facts: dict | None = None
 
     def __post_init__(self) -> None:
         if not self.image_id:
             raise ValueError("image_id is required")
         if not self.domain_type:
             raise ValueError("domain_type is required")
-

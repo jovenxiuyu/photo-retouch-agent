@@ -7,10 +7,12 @@ from app.application.ports import (
     AssetReader,
     PlanCatalog,
     PromptAnalyzer,
+    StylingCatalog,
 )
 from app.brains.base import PromptBrain
 from app.domain.analysis import PhotoAnalysis
 from app.domain.retouch import RetouchPlan
+from app.domain.styling import StylingProposal
 from app.domains.registry import DomainRegistry
 from app.schemas.mappers import (
     analysis_to_domain,
@@ -70,3 +72,14 @@ class RegistryPlanCatalog(PlanCatalog):
         plans = planner.create_plans(analysis_to_schema(analysis))
         return tuple(plan_to_domain(plan) for plan in plans)
 
+
+class RegistryStylingCatalog(StylingCatalog):
+    def __init__(self, registry: DomainRegistry) -> None:
+        self._registry = registry
+
+    def create_styling_proposals(
+        self,
+        analysis: PhotoAnalysis,
+    ) -> tuple[StylingProposal, ...]:
+        stylist = self._registry.get_stylist(analysis.domain_type)
+        return stylist.create_proposals(analysis)

@@ -6,9 +6,11 @@ from app.application.ports import (
     AssetReader,
     PlanCatalog,
     PromptAnalyzer,
+    StylingCatalog,
 )
 from app.domain.analysis import PhotoAnalysis
 from app.domain.retouch import RetouchPlan
+from app.domain.styling import StylingProposal
 
 
 class AssetNotFoundError(LookupError):
@@ -48,3 +50,16 @@ class CreateRetouchPlans:
     def execute(self, analysis: PhotoAnalysis) -> tuple[RetouchPlan, ...]:
         return tuple(self._planners.create_plans(analysis))
 
+
+class CreateStylingProposals:
+    """Design three complete looks for the person in an analysed portrait.
+
+    This is pure computation over the analysis (no network, no image model),
+    so it never incurs a paid request.
+    """
+
+    def __init__(self, stylists: StylingCatalog) -> None:
+        self._stylists = stylists
+
+    def execute(self, analysis: PhotoAnalysis) -> tuple[StylingProposal, ...]:
+        return tuple(self._stylists.create_styling_proposals(analysis))

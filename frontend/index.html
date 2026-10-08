@@ -183,6 +183,35 @@
             </button>
           </div>
 
+          <div class="section-row ai-section-title">
+            <h2>AI 整体形象设计</h2>
+            <span id="stylingSource">正在读取风格库…</span>
+          </div>
+          <div class="styling-toolbar">
+            <button class="styling-design-button" id="stylingDesignButton" type="button">
+              <span>✦</span>
+              <b>让 AI 设计三套造型</b>
+            </button>
+            <small id="stylingCostNote" class="styling-cost">
+              方案设计免费（0 次付费请求）；出图只对选中的一套发起 1 次图像编辑请求。
+            </small>
+          </div>
+          <div class="styling-grid" id="stylingGrid" hidden></div>
+          <div class="styling-refine" id="stylingRefine" hidden>
+            <label class="prompt-field">
+              <span>对选中的造型提出修改</span>
+              <textarea
+                id="stylingInstruction"
+                rows="2"
+                placeholder="例如：头发再短一点 / 衣服换成皮衣 / 妆再大胆一点"
+              ></textarea>
+            </label>
+            <button class="styling-refine-button" id="stylingRefineButton" type="button">
+              二次修改选中造型
+            </button>
+          </div>
+          <p class="ai-feedback" id="stylingFeedback" aria-live="polite"></p>
+
           <label class="prompt-field">
             <span>补充你的要求</span>
             <textarea
@@ -397,6 +426,6 @@
       </div>
     </footer>
 
-    <script type="module" src="./js/app.js?v=0.6.0"></script>
+    <script type="module" src="./js/app.js?v=0.7.0"></script>
   </body>
 </html>

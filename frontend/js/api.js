@@ -46,8 +46,24 @@ export function createPlans(analysis) {
   });
 }
 
+export function createStylingProposals(analysis) {
+  return request("/styling/proposals", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ analysis }),
+  });
+}
+
 export function getProviderCapabilities() {
   return request("/retouch/providers");
+}
+
+export function getStylingProviders() {
+  return request("/styling/providers");
+}
+
+export function getJob(jobId) {
+  return request(`/retouch/jobs/${jobId}`);
 }
 
 function modelHeaders(brain = {}, action = {}) {

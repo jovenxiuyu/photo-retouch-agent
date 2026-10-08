@@ -1,6 +1,7 @@
 .DS_Store
 .env
 __pycache__/
+*.egg-info/
 *.py[cod]
 .pytest_cache/
 .venv/
@@ -10,4 +11,5 @@ data/uploads/
 data/outputs/
 data/jobs/
 data/inputs/
+data/recovery/
 .idea/

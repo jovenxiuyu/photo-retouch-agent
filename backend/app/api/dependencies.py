@@ -5,9 +5,14 @@ from fastapi import Depends, Request
 from app.api.application_adapters import (
     RegistryAnalysisCatalog,
     RegistryPlanCatalog,
+    RegistryStylingCatalog,
     StorageAssetReader,
 )
-from app.application.use_cases import AnalyzePhoto, CreateRetouchPlans
+from app.application.use_cases import (
+    AnalyzePhoto,
+    CreateRetouchPlans,
+    CreateStylingProposals,
+)
 from app.application.ports import JobDispatcher
 from app.bootstrap import AppContainer
 from app.domains.registry import DomainRegistry
@@ -86,3 +91,9 @@ def get_create_plans_use_case(
     domains: Annotated[DomainRegistry, Depends(get_domain_registry)],
 ) -> CreateRetouchPlans:
     return CreateRetouchPlans(RegistryPlanCatalog(domains))
+
+
+def get_create_styling_proposals_use_case(
+    domains: Annotated[DomainRegistry, Depends(get_domain_registry)],
+) -> CreateStylingProposals:
+    return CreateStylingProposals(RegistryStylingCatalog(domains))

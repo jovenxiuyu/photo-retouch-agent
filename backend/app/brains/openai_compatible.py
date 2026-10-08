@@ -58,6 +58,8 @@ class OpenAICompatiblePromptBrain:
             "recommendedStyles、riskFlags。domainType 只能是 portrait、landscape、"
             "product、general 之一。subjects 必须是单个 JSON 对象而不是数组，"
             "且只包含 count、position、faceVisibility 三个字段。"
+            "baselineAnalysis.faceFacts 是本地已测量的可见外形事实，只能原样沿用，"
+            "不要改写、补写或据此推断人物的性别、年龄、职业等隐私属性。"
         )
         user_text = json.dumps(
             {
@@ -91,6 +93,8 @@ class OpenAICompatiblePromptBrain:
             "brainProvider": self.provider_name,
             "brainModel": self.model_name,
             "visionMode": self.vision_mode,
+            # faceFacts are measured locally from the pixels, never by the model.
+            "faceFacts": baseline_payload.get("faceFacts"),
         }
         try:
             return PhotoAnalysis.model_validate(merged)

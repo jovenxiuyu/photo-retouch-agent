@@ -19,6 +19,11 @@ UNSUPPORTED_PARAMETERS = ("image_size",)
 
 METADATA_DIRNAME = "_meta"
 
+# A failed download must not cost a second billed generation. The short-lived signed
+# result URL is therefore parked owner-only outside the outputs tree, so a download-only
+# retry can pick it up; it is never logged and is deleted once recovery is done.
+RECOVERY_DIRNAME = "recovery"
+
 # The edit model answers with a short-lived CDN URL and that CDN does not always label
 # its payload precisely: real PNG bytes are regularly served as
 # ``application/octet-stream``. Both declarations are therefore acceptable; any other
@@ -108,7 +113,16 @@ class SiliconFlowImageProvider:
             )
             result = self._parse_response(response)
             image_url = self._extract_image_url(result)
-            download = await self._download_image(client, image_url)
+            # An untrusted or non-public result URL is refused before anything is
+            # parked, so only a legitimately fetched URL can ever be kept for retry.
+            self._validate_download_url(image_url)
+            try:
+                download = await self._download_image(client, image_url)
+            except SiliconFlowProviderError:
+                # The generation was already billed, so keep the result URL available
+                # for a download-only retry. The failure itself is still fatal here.
+                self._stash_recovery_url(output_path, image_url)
+                raise
 
         # The file is only written after the bytes have been decoded into a real picture.
         self._store_download(download, output_path)
@@ -298,6 +312,36 @@ class SiliconFlowImageProvider:
     def _store_download(download: DownloadedImage, output_path: Path) -> None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(download.content)
+
+    def _stash_recovery_url(self, output_path: Path, image_url: str) -> None:
+        """Park a failed download's result URL for a bounded, download-only retry.
+
+        The URL is signed and short-lived, so the file is written owner-only, kept out
+        of the outputs tree, never logged and meant to be removed after recovery. A
+        failure to stash is swallowed: the original download error is what matters.
+        """
+        try:
+            directory = output_path.parent.parent / RECOVERY_DIRNAME
+            directory.mkdir(parents=True, exist_ok=True)
+            target = directory / f"{output_path.stem}.url.json"
+            target.write_text(
+                json.dumps(
+                    {
+                        "provider": self.provider_name,
+                        "model": self.model_name,
+                        "outputFile": output_path.name,
+                        "stashedAt": datetime.now(timezone.utc).isoformat(),
+                        "note": "signed, short-lived result URL; delete after recovery",
+                        "resultUrl": image_url,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            target.chmod(0o600)
+        except OSError:
+            pass
 
     @staticmethod
     def _validate_download_url(url: str) -> str:
