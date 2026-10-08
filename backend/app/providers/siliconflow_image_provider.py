@@ -1,11 +1,12 @@
 from __future__ import annotations
 import base64
+import ipaddress
 import json
 import mimetypes
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, NamedTuple, Sequence
 
 import httpx
 from PIL import Image, UnidentifiedImageError
@@ -17,6 +18,29 @@ from app.schemas.retouch import RetouchPlan
 UNSUPPORTED_PARAMETERS = ("image_size",)
 
 METADATA_DIRNAME = "_meta"
+
+# The edit model answers with a short-lived CDN URL and that CDN does not always label
+# its payload precisely: real PNG bytes are regularly served as
+# ``application/octet-stream``. Both declarations are therefore acceptable; any other
+# explicit type (a ``text/html`` sign-in page, an ``application/json`` error envelope,
+# ...) is refused up front. Decoding decides the rest, so a mislabelled real image is
+# accepted while a well-labelled fake one is still rejected.
+GENERIC_BINARY_CONTENT_TYPES = frozenset({"application/octet-stream", "binary/octet-stream"})
+
+# Bytes are only trusted once Pillow fully decodes them into one of these formats.
+SUPPORTED_IMAGE_FORMATS = frozenset({"PNG", "JPEG", "WEBP"})
+
+REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+MAX_DOWNLOAD_REDIRECTS = 3
+
+
+class DownloadedImage(NamedTuple):
+    """A validated picture fetched from the provider's result URL."""
+
+    content: bytes
+    content_type: str
+    final_url: str
+    status_code: int
 
 
 class SiliconFlowProviderError(RuntimeError):
@@ -69,7 +93,9 @@ class SiliconFlowImageProvider:
 
         async with httpx.AsyncClient(
             timeout=self.timeout_seconds,
-            follow_redirects=True,
+            # Redirects are resolved by hand so every hop can be validated: this URL
+            # arrives from a third party and must not become an arbitrary fetch target.
+            follow_redirects=False,
             transport=self._transport,
         ) as client:
             response = await client.post(
@@ -82,15 +108,17 @@ class SiliconFlowImageProvider:
             )
             result = self._parse_response(response)
             image_url = self._extract_image_url(result)
-            image_response = await client.get(image_url)
-            self._save_download(image_response, output_path)
+            download = await self._download_image(client, image_url)
 
+        # The file is only written after the bytes have been decoded into a real picture.
+        self._store_download(download, output_path)
         self._write_metadata(
             output_path,
             plan=plan,
             response=response,
             payload=result,
-            content_type=image_response.headers.get("content-type", ""),
+            content_type=download.content_type,
+            source_host=httpx.URL(download.final_url).host,
         )
 
     def _build_payload(
@@ -172,26 +200,145 @@ class SiliconFlowImageProvider:
             "SiliconFlow API response did not contain an output image."
         )
 
-    def _save_download(self, response: httpx.Response, output_path: Path) -> None:
-        if response.is_error:
-            raise SiliconFlowProviderError(
-                f"Failed to download SiliconFlow output image (HTTP {response.status_code})."
-            )
-        content_type = response.headers.get("content-type", "")
-        if content_type and not content_type.startswith("image/"):
-            raise SiliconFlowProviderError("SiliconFlow output URL did not return an image.")
-        if len(response.content) > self.download_limit_bytes:
-            raise SiliconFlowProviderError("SiliconFlow output image exceeded the download limit.")
-        try:
-            with Image.open(BytesIO(response.content)) as image:
-                image.verify()
-        except (UnidentifiedImageError, OSError) as exc:
-            raise SiliconFlowProviderError(
-                "SiliconFlow output image could not be decoded."
-            ) from exc
+    async def _download_image(
+        self, client: httpx.AsyncClient, image_url: str
+    ) -> DownloadedImage:
+        """Fetch the result URL and return the bytes only if they are a real picture.
 
+        Every hop is revalidated, the body is read under a hard byte ceiling, and any
+        failure aborts the job: there is no fallback to a mock or a text-to-image call.
+        """
+        request_url = self._validate_download_url(image_url)
+        for attempt in range(MAX_DOWNLOAD_REDIRECTS + 1):
+            async with client.stream("GET", request_url) as response:
+                if response.status_code in REDIRECT_STATUSES:
+                    location = response.headers.get("location")
+                    if not location:
+                        raise SiliconFlowProviderError(
+                            "SiliconFlow output URL redirected without a target."
+                        )
+                    if attempt == MAX_DOWNLOAD_REDIRECTS:
+                        raise SiliconFlowProviderError(
+                            "SiliconFlow output URL redirected too many times."
+                        )
+                    request_url = self._validate_download_url(
+                        str(httpx.URL(request_url).join(location))
+                    )
+                    continue
+                if response.is_error:
+                    raise SiliconFlowProviderError(
+                        "Failed to download SiliconFlow output image "
+                        f"(HTTP {response.status_code})."
+                    )
+                content_type = response.headers.get("content-type", "")
+                if not self._content_type_may_carry_an_image(content_type):
+                    # Read the (bounded) body only to report how much was returned, so a
+                    # failed run stays diagnosable without another billed generation.
+                    body = await self._read_limited(response)
+                    raise SiliconFlowProviderError(
+                        "SiliconFlow output URL did not return an image "
+                        f"(content-type={content_type!r}, bytes={len(body)})."
+                    )
+                content = await self._read_limited(response)
+                self._verify_image_bytes(content, content_type)
+                return DownloadedImage(
+                    content=content,
+                    content_type=content_type,
+                    final_url=request_url,
+                    status_code=response.status_code,
+                )
+        raise SiliconFlowProviderError("SiliconFlow output URL could not be resolved.")
+
+    async def _read_limited(self, response: httpx.Response) -> bytes:
+        """Read a body while enforcing the download ceiling as it arrives."""
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in response.aiter_bytes():
+            total += len(chunk)
+            if total > self.download_limit_bytes:
+                raise SiliconFlowProviderError(
+                    "SiliconFlow output image exceeded the download limit."
+                )
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    @staticmethod
+    def _content_type_may_carry_an_image(content_type: str) -> bool:
+        declared = content_type.split(";", 1)[0].strip().lower()
+        if not declared:
+            # Some CDNs omit the header entirely; decoding still has the final say.
+            return True
+        return declared.startswith("image/") or declared in GENERIC_BINARY_CONTENT_TYPES
+
+    @staticmethod
+    def _verify_image_bytes(content: bytes, content_type: str = "") -> None:
+        """Fully decode the body; the declaration alone never counts as proof."""
+        if not content:
+            raise SiliconFlowProviderError(
+                "SiliconFlow output image was empty "
+                f"(content-type={content_type!r}, bytes=0)."
+            )
+        try:
+            with Image.open(BytesIO(content)) as image:
+                image_format = image.format
+                # ``load()`` decodes the pixels: a truncated file that carries a valid
+                # signature still fails here instead of reaching the output directory.
+                image.load()
+        except (UnidentifiedImageError, OSError, ValueError) as exc:
+            raise SiliconFlowProviderError(
+                "SiliconFlow output image could not be decoded "
+                f"(content-type={content_type!r}, bytes={len(content)})."
+            ) from exc
+        if image_format not in SUPPORTED_IMAGE_FORMATS:
+            raise SiliconFlowProviderError(
+                f"SiliconFlow output image format {image_format!r} is not supported."
+            )
+
+    @staticmethod
+    def _store_download(download: DownloadedImage, output_path: Path) -> None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_bytes(response.content)
+        output_path.write_bytes(download.content)
+
+    @staticmethod
+    def _validate_download_url(url: str) -> str:
+        """Reject anything that is not a plain, public http(s) location.
+
+        The URL is supplied by an upstream API response, so it is untrusted input: no
+        other schemes, no embedded credentials, and no loopback, link-local or
+        private-network target (SSRF guard).
+        """
+        parsed = httpx.URL(url)
+        if parsed.scheme not in ("http", "https"):
+            raise SiliconFlowProviderError(
+                "SiliconFlow output URL is not an http(s) address; refusing to download."
+            )
+        host = parsed.host
+        if not host:
+            raise SiliconFlowProviderError("SiliconFlow output URL has no host.")
+        if parsed.userinfo:
+            raise SiliconFlowProviderError(
+                "SiliconFlow output URL carries credentials; refusing to download."
+            )
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            if host.lower() == "localhost" or host.lower().endswith(".localhost"):
+                raise SiliconFlowProviderError(
+                    "SiliconFlow output URL points at a local host; refusing to download."
+                )
+        else:
+            if (
+                address.is_private
+                or address.is_loopback
+                or address.is_link_local
+                or address.is_unspecified
+                or address.is_reserved
+            ):
+                raise SiliconFlowProviderError(
+                    "SiliconFlow output URL points at a non-public address; "
+                    "refusing to download."
+                )
+        return str(parsed)
 
     def _write_metadata(
         self,
@@ -200,11 +347,15 @@ class SiliconFlowImageProvider:
         response: httpx.Response,
         payload: dict[str, Any],
         content_type: str,
+        source_host: str | None = None,
     ) -> None:
         """Persist non-secret provenance next to the generated image.
 
         The file lives in a ``_meta`` subdirectory so image-id lookups, which glob
         ``outputs/<image_id>.*``, never mistake metadata for a picture.
+
+        Only the host of the result URL is recorded: the full URL carries short-lived
+        signature parameters and is deliberately not persisted.
         """
         metadata_dir = output_path.parent / METADATA_DIRNAME
         metadata_dir.mkdir(parents=True, exist_ok=True)
@@ -226,6 +377,7 @@ class SiliconFlowImageProvider:
             "imageCount": image_count,
             "bytes": output_path.stat().st_size,
             "contentType": content_type or None,
+            "sourceHost": source_host,
             "seed": payload.get("seed"),
             "timings": payload.get("timings"),
             "usage": payload.get("usage"),

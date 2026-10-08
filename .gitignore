@@ -9,4 +9,5 @@ backend/data/
 data/uploads/
 data/outputs/
 data/jobs/
+data/inputs/
 .idea/
