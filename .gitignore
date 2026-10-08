@@ -31,3 +31,14 @@ artifacts/
 evidence/p29-cropandstitch-audit/inpaint_cropandstitch.py
 evidence/p29-cropandstitch-audit/upstream-README.md
 evidence/p29-cropandstitch-audit/readme-api.json
+
+# P2.9 RunningHub live check: raw third-party doc HTML dumps and the 32 MB
+# /object_info catalogue stay local-only (fetched from runninghub.cn via the
+# native ComfyUI proxy). Findings + refetch commands:
+# evidence/p29-runninghub-live-audit.md
+evidence/p29-runninghub-live/*.html
+evidence/p29-runninghub-live/*.txt
+evidence/p29-runninghub-live/*.json
+evidence/p29-runninghub-live/*.py
+# ...but keep the small derived node contract (factual API metadata).
+!evidence/p29-runninghub-live/node-contract-cropandstitch.json
