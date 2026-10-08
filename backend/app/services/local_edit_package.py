@@ -88,7 +88,9 @@ MASK_LEVELS = (0, 255)
 #: blouse and browline glasses, while the ``artistic_wave`` axis below says
 #: burgundy brown, cream/burgundy/muted-green draping and gold hoops. So this
 #: alias picks the closest *existing* design, it does not reproduce that plan.
-#: Sourcing the stored plan verbatim is a separate change, not made here.
+#: To carry that plan verbatim instead, drive the builder with the stored plan
+#: itself (``--plan ai_elegant_refined`` on the CLI), which reads the prompt
+#: back out of the job file rather than composing it from this axis.
 STYLE_AXIS_ALIASES: dict[str, str] = {
     "urban_short": "urban_short",
     "urban": "urban_short",
@@ -132,6 +134,182 @@ def resolve_style_id(style_id: str) -> str:
             f"unknown style {style_id!r}; known ids: {', '.join(style_ids())}"
         )
     return axis
+
+
+#: The job store this project already writes: one JSON file per portrait job,
+#: each holding the plan that produced it. A stored plan is *not* an axis. It is
+#: the verbatim brief a real model authored for one photo, so it is read back
+#: from disk rather than re-derived from an axis name -- re-deriving is exactly
+#: how "精致优雅风" drifted into the neighbouring ``artistic_wave`` copy.
+PROJECT_JOBS_DIR = PROJECT_ROOT / "data" / "jobs"
+
+#: Statuses that mean "this plan really ran". A stored plan is only offered for
+#: reuse once the job that wrote it finished.
+PLAN_SUCCEEDED_STATUSES = frozenset({"succeeded", "success", "completed"})
+
+
+class StoredPlanError(ValueError):
+    """A stored plan exists but cannot be read back exactly as it was written."""
+
+
+@dataclass(frozen=True)
+class StoredPlan:
+    """One historical plan, verbatim, plus where it came from."""
+
+    proposal: StylingProposal
+    job_path: Path
+    job_id: str
+    status: str
+    model_provider: str
+    model_name: str
+    created_at: str
+
+    @property
+    def plan_id(self) -> str:
+        return self.proposal.plan_id
+
+    @property
+    def succeeded(self) -> bool:
+        return self.status in PLAN_SUCCEEDED_STATUSES
+
+    def provenance(self) -> dict[str, Any]:
+        return {
+            "kind": "stored-plan",
+            "plan_id": self.proposal.plan_id,
+            "title": self.proposal.title,
+            "job_id": self.job_id,
+            "job_path": str(self.job_path),
+            "job_status": self.status,
+            "model_provider": self.model_provider,
+            "model_name": self.model_name,
+            "created_at": self.created_at,
+            "style_reason_source": "plan.description",
+            "prompt_source": "plan.edit_prompt (verbatim)",
+            "note": (
+                "the prompts below are this plan's own text, read back from the "
+                "job store, not a re-composition from a style axis"
+            ),
+        }
+
+
+def _stored_identity_anchors(edit_prompt: str) -> tuple[str, ...]:
+    """The plan's own ``Identity anchors`` line, split into single promises."""
+    line = _prompt_section(edit_prompt, "Identity anchors")
+    if not line:
+        return ()
+    body = line.split(":", 1)[1] if ":" in line else line
+    return tuple(part.strip() for part in body.split(";") if part.strip())
+
+
+def _stored_presets(edit_prompt: str) -> tuple[str, ...]:
+    """The plan's own ``Stylekit presets applied`` line, split into ids."""
+    line = _prompt_section(edit_prompt, "Stylekit presets applied:")
+    return tuple(part.strip() for part in line.split(",") if part.strip())
+
+
+def decode_stored_plan(job_path: Path | str, plan_id: str | None = None) -> StoredPlan:
+    """Read one job file back into the proposal it recorded, verbatim.
+
+    The stored plan only carries what the model actually wrote (title, the
+    multi-line edit prompt, the negative prompt, the expected changes). The
+    axis-only fields (``hair_plan``, ``palette``, ...) are left empty on
+    purpose: the labelled lines inside ``edit_prompt`` are the real text and the
+    prompt bundle reads them from there, so filling the fields as well would
+    duplicate every sentence.
+    """
+    path = Path(job_path).expanduser()
+    if not path.is_file():
+        raise StoredPlanError(f"job file not found: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise StoredPlanError(f"{path} is not readable JSON: {exc}") from exc
+    plan = payload.get("plan") if isinstance(payload, dict) else None
+    if not isinstance(plan, dict):
+        raise StoredPlanError(f"{path} holds no plan object")
+    stored_id = str(plan.get("plan_id") or "")
+    if not stored_id:
+        raise StoredPlanError(f"the plan in {path} has no plan_id")
+    if plan_id is not None and stored_id != plan_id:
+        raise StoredPlanError(f"{path} holds plan {stored_id!r}, not {plan_id!r}")
+    edit_prompt = str(plan.get("edit_prompt") or "")
+    if not edit_prompt.strip():
+        raise StoredPlanError(f"plan {stored_id!r} in {path} has an empty edit_prompt")
+    title = str(plan.get("title") or stored_id)
+    description = str(plan.get("description") or "")
+    proposal = StylingProposal(
+        plan_id=stored_id,
+        domain_type=str(plan.get("domain_type") or "portrait"),
+        title=title,
+        name=title,
+        design_axis="stored-plan",
+        design_direction=title,
+        description=description,
+        design_reason=description,
+        intensity=str(plan.get("intensity") or "medium"),
+        hair_plan="",
+        makeup_plan="",
+        outfit_plan="",
+        accessory_plan="",
+        palette="",
+        identity_anchors=_stored_identity_anchors(edit_prompt),
+        expected_changes=tuple(
+            str(item) for item in (plan.get("expected_changes") or ())
+        ),
+        edit_prompt=edit_prompt,
+        negative_prompt=str(plan.get("negative_prompt") or ""),
+        design_mode="ai",
+        source_provider=str(payload.get("model_provider") or ""),
+        selected_presets=_stored_presets(edit_prompt),
+    )
+    return StoredPlan(
+        proposal=proposal,
+        job_path=path.resolve(),
+        job_id=str(payload.get("job_id") or path.stem),
+        status=str(payload.get("status") or ""),
+        model_provider=str(payload.get("model_provider") or ""),
+        model_name=str(payload.get("model_name") or ""),
+        created_at=str(payload.get("created_at") or ""),
+    )
+
+
+def stored_plan_ids(jobs_dir: Path | str | None = None) -> tuple[str, ...]:
+    """Every plan id the job store holds, succeeded jobs first."""
+    directory = Path(jobs_dir or PROJECT_JOBS_DIR).expanduser()
+    if not directory.is_dir():
+        return ()
+    ids: list[str] = []
+    for path in sorted(directory.glob("job_*.json")):
+        try:
+            stored = decode_stored_plan(path)
+        except StoredPlanError:
+            continue
+        if stored.plan_id not in ids:
+            ids.append(stored.plan_id)
+    return tuple(ids)
+
+
+def find_stored_plan(
+    plan_id: str, jobs_dir: Path | str | None = None
+) -> StoredPlan:
+    """Find the stored job that owns ``plan_id``; prefer one that succeeded."""
+    wanted = str(plan_id or "").strip()
+    if not wanted:
+        raise StoredPlanError("a plan id is required")
+    directory = Path(jobs_dir or PROJECT_JOBS_DIR).expanduser()
+    if not directory.is_dir():
+        raise StoredPlanError(f"job store not found: {directory}")
+    matches: list[StoredPlan] = []
+    for path in sorted(directory.glob("job_*.json")):
+        try:
+            stored = decode_stored_plan(path)
+        except StoredPlanError:
+            continue
+        if stored.plan_id == wanted:
+            matches.append(stored)
+    if not matches:
+        raise StoredPlanError(f"no stored job in {directory} holds plan {wanted!r}")
+    return max(matches, key=lambda item: (item.succeeded, item.created_at))
 
 
 # --------------------------------------------------------------------- helpers
@@ -303,13 +481,30 @@ class LocalEditPackageBuilder:
     def build(
         self,
         photo_path: Path | str,
-        style_id: str,
+        style_id: str | None = None,
         out_dir: Path | str | None = None,
+        *,
+        plan: StoredPlan | None = None,
     ) -> LocalEditPackage:
+        """Build the package for one photo.
+
+        Two ways to name the look, and they are not interchangeable:
+
+        * ``style_id`` picks one of the stylist's template axes, composed from
+          scratch for this photo's facts;
+        * ``plan`` carries a *stored* AI-authored plan and uses its own text
+          verbatim. It wins when both are given, because the whole point of a
+          stored plan is that nothing re-derives or paraphrases it.
+        """
         photo = Path(photo_path).expanduser().resolve()
         if not photo.is_file():
             raise FileNotFoundError(f"photo not found: {photo}")
-        axis = resolve_style_id(style_id)
+        if plan is None and not style_id:
+            raise UnknownStyleError(
+                "either a style id or a stored plan is required; known style "
+                f"ids: {', '.join(style_ids())}"
+            )
+        axis = plan.plan_id if plan is not None else resolve_style_id(style_id)
 
         if out_dir is None:
             stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -321,7 +516,7 @@ class LocalEditPackageBuilder:
         image = np.asarray(Image.open(photo).convert("RGB"))
         height, width = int(image.shape[0]), int(image.shape[1])
 
-        proposal = self._proposal(photo, axis)
+        proposal = plan.proposal if plan is not None else self._proposal(photo, axis)
         mask_build = self._build_masks(photo, root)
         mask_set = mask_build.mask_set
 
@@ -343,7 +538,9 @@ class LocalEditPackageBuilder:
             files[key] = write_binary_mask(root / name, region)
 
         stats = self._stats(image, mask_set)
-        prompt_bundle = self._prompt_bundle(proposal, axis)
+        prompt_bundle = self._prompt_bundle(
+            proposal, axis, plan.provenance() if plan is not None else None
+        )
         previews = self._previews(image, mask_set, root)
         files.update(previews)
 
@@ -356,6 +553,7 @@ class LocalEditPackageBuilder:
             stats,
             mask_build.acceptance,
             (width, height),
+            plan.provenance() if plan is not None else None,
         )
         files["manifest"] = self._write_json(root / "manifest.json", manifest)
 
@@ -633,7 +831,12 @@ class LocalEditPackageBuilder:
 
     # ----------------------------------------------------------------- prompts
 
-    def _prompt_bundle(self, proposal: StylingProposal, axis: str) -> dict[str, Any]:
+    def _prompt_bundle(
+        self,
+        proposal: StylingProposal,
+        axis: str,
+        plan_provenance: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         hair_line = _prompt_section(proposal.edit_prompt, "Hair:")
         outfit_line = _prompt_section(proposal.edit_prompt, "Outfit:")
         accessory_line = _prompt_section(proposal.edit_prompt, "Accessories:")
@@ -668,7 +871,7 @@ class LocalEditPackageBuilder:
         ).strip()
 
         constraints = self._identity_constraints(proposal)
-        return {
+        bundle: dict[str, Any] = {
             "style_id": axis,
             "style_name": proposal.name,
             "style_reason": proposal.design_reason,
@@ -703,6 +906,9 @@ class LocalEditPackageBuilder:
                 "engine_order": ["clothing_edit_mask", "hair_edit_mask"],
             },
         }
+        if plan_provenance is not None:
+            bundle["plan_provenance"] = plan_provenance
+        return bundle
 
     def _identity_constraints(self, proposal: StylingProposal) -> dict[str, Any]:
         rules = [
@@ -757,8 +963,9 @@ class LocalEditPackageBuilder:
         stats: dict[str, Any],
         acceptance: dict[str, Any],
         size: tuple[int, int],
+        plan_provenance: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return {
+        manifest = {
             "package_format": "local-edit-package",
             "pipeline_version": PIPELINE_VERSION,
             "generated_at": _now(),
@@ -861,12 +1068,21 @@ class LocalEditPackageBuilder:
                 "segmentation": "SCHP ATR-18 ONNX, CPU inference (app.domains.portrait.human_parsing)",
                 "landmarks": "MediaPipe FaceMesh (app.domains.portrait.face_lock)",
                 "masks": "app.domains.portrait.edit_mask via app.services.native_mask_inpainting",
-                "styling": "app.domains.portrait.stylist (template axis composition)",
+                "styling": (
+                    "stored AI plan "
+                    f"{plan_provenance['plan_id']} from {plan_provenance['job_id']} "
+                    "(edit_prompt read back verbatim)"
+                    if plan_provenance is not None
+                    else "app.domains.portrait.stylist (template axis composition)"
+                ),
                 "git": self._git_info(),
                 "network_calls": 0,
                 "paid_generations": 0,
             },
         }
+        if plan_provenance is not None:
+            manifest["styling_plan"] = plan_provenance
+        return manifest
 
     def _relative(self, path: Path, root: Path) -> str:
         try:
@@ -899,12 +1115,19 @@ __all__ = [
     "LocalEditPackageUnavailable",
     "MASK_LEVELS",
     "PIPELINE_VERSION",
+    "PLAN_SUCCEEDED_STATUSES",
+    "PROJECT_JOBS_DIR",
     "STYLE_AXIS_ALIASES",
+    "StoredPlan",
+    "StoredPlanError",
     "UnknownStyleError",
+    "decode_stored_plan",
+    "find_stored_plan",
     "git_info",
     "mask_pixels",
     "resolve_style_id",
     "sha256_file",
+    "stored_plan_ids",
     "style_ids",
     "write_binary_mask",
 ]

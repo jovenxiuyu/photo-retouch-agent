@@ -42,3 +42,8 @@ evidence/p29-runninghub-live/*.json
 evidence/p29-runninghub-live/*.py
 # ...but keep the small derived node contract (factual API metadata).
 !evidence/p29-runninghub-live/node-contract-cropandstitch.json
+
+# P2.9 live ComfyUI probe: the 32 MB /object_info dump fetched from the GPU
+# worker stays local-only. The findings it supports are written up in
+# evidence/p29-runninghub-audit.md and evidence/p29-runninghub-live-audit.md.
+evidence/p29-live-run/*.json

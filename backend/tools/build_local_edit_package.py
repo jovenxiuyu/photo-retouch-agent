@@ -22,6 +22,11 @@ Usage -- from ``backend/``::
 
     # what ids the stylist owns
     ../.venv/bin/python -m tools.build_local_edit_package --list-styles
+
+    # or drive a *stored* AI plan instead of an axis: the prompt bundle then
+    # carries that plan's own text verbatim (see --list-plans)
+    ../.venv/bin/python -m tools.build_local_edit_package \\
+        --photo data/inputs/IMG_3651.jpg --plan ai_elegant_refined
 """
 
 from __future__ import annotations
@@ -42,8 +47,12 @@ from app.core.config import settings  # noqa: E402
 from app.services.local_edit_package import (  # noqa: E402
     LocalEditPackageBuilder,
     LocalEditPackageUnavailable,
+    StoredPlanError,
     UnknownStyleError,
+    decode_stored_plan,
+    find_stored_plan,
     resolve_style_id,
+    stored_plan_ids,
     style_ids,
 )
 
@@ -103,6 +112,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--plan",
+        default=None,
+        help=(
+            "a stored AI plan id (see --list-plans); the package then carries "
+            "that plan's own edit prompt verbatim instead of an axis composition"
+        ),
+    )
+    parser.add_argument(
+        "--job",
+        default=None,
+        help="the job file a --plan id lives in (defaults to searching data/jobs)",
+    )
+    parser.add_argument(
         "--out-dir",
         default=None,
         help="package directory (defaults to artifacts/local-edit-package/<timestamp>)",
@@ -119,6 +141,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--list-styles",
         action="store_true",
         help="print every style id this project owns and exit",
+    )
+    parser.add_argument(
+        "--list-plans",
+        action="store_true",
+        help="print every plan id the local job store holds and exit",
     )
     parser.add_argument(
         "--json",
@@ -139,19 +166,51 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {marker} {style_id}  ->  {axis}")
         return 0
 
-    if not args.photo or not args.style:
-        print("--photo and --style are both required (or use --list-styles)", file=sys.stderr)
+    if args.list_plans:
+        print("plan ids accepted by --plan (from data/jobs):")
+        ids = stored_plan_ids()
+        if not ids:
+            print("  (the job store holds no readable plan)")
+            return 1
+        for plan_id in ids:
+            print(f"    {plan_id}")
+        return 0
+
+    if args.style and args.plan:
+        print("BLOCKED -- --style and --plan are mutually exclusive", file=sys.stderr)
+        return 2
+
+    if not args.photo or not (args.style or args.plan):
+        print(
+            "--photo plus one of --style / --plan is required "
+            "(or use --list-styles / --list-plans)",
+            file=sys.stderr,
+        )
         return 2
 
     photo = Path(args.photo).expanduser().resolve()
     if not photo.is_file():
         print(f"BLOCKED -- photo not found: {photo}", file=sys.stderr)
         return 1
-    try:
-        axis = resolve_style_id(args.style)
-    except UnknownStyleError as exc:
-        print(f"BLOCKED -- {exc}", file=sys.stderr)
-        return 2
+
+    stored_plan = None
+    if args.plan:
+        try:
+            stored_plan = (
+                find_stored_plan(args.plan)
+                if not args.job
+                else decode_stored_plan(args.job, args.plan)
+            )
+        except StoredPlanError as exc:
+            print(f"BLOCKED -- {exc}", file=sys.stderr)
+            return 2
+        axis = stored_plan.plan_id
+    else:
+        try:
+            axis = resolve_style_id(args.style)
+        except UnknownStyleError as exc:
+            print(f"BLOCKED -- {exc}", file=sys.stderr)
+            return 2
 
     segmenter_factory = None
     labels_path: Path | None = None
@@ -172,13 +231,22 @@ def main(argv: list[str] | None = None) -> int:
     builder = build_builder(segmenter_factory)
     print("=== local edit package (no network, no key, no generation) ===")
     print(f"photo          : {photo}")
-    print(f"style          : {axis}  (requested {args.style!r})")
+    if stored_plan is not None:
+        print(
+            f"plan           : {axis}  ({stored_plan.proposal.title!r}, "
+            f"{stored_plan.job_id}, {stored_plan.model_provider} "
+            f"{stored_plan.model_name}, status={stored_plan.status})"
+        )
+        print(f"plan source    : {stored_plan.job_path}")
+        print("prompt source  : plan.edit_prompt (verbatim, not an axis)")
+    else:
+        print(f"style          : {axis}  (requested {args.style!r})")
     print(
         "labels from    : "
         + (str(labels_path) if labels_path else "live SCHP inference")
     )
     try:
-        package = builder.build(photo, axis, args.out_dir)
+        package = builder.build(photo, axis, args.out_dir, plan=stored_plan)
     except LocalEditPackageUnavailable as exc:
         print()
         print("BLOCKED")
