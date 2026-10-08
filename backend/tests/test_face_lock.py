@@ -489,6 +489,143 @@ def test_protected_regions_come_from_the_original_photograph(tmp_path: Path) -> 
     assert set(report.diagnostics["lockedRegions"]) == {"eyes", "eyebrows", "nose", "mouth_and_teeth", "jaw_and_chin", "cheeks", "outer_contour"}
 
 
+# ------------------------------------------------------------------ P2.5
+# The protection mask is derived from the face outline, so on a long-haired
+# subject it also covers the hair *they used to have* along the hairline.
+# Pasting those pixels back at full opacity printed a ragged dark band on the
+# forehead. The fix shaves the bit-exact core back from the content boundary
+# (``core_erode_ratio``) and lets the existing feather carry the transition.
+# These tests pin the two halves of that trade-off: the boundary really moved
+# inwards, and no facial feature was uncovered by it.
+
+
+def _lock_with_erosion(tmp_path: Path, ratio: float, name: str):
+    case = happy_path_case(tmp_path, name)
+    config = fl.FaceLockConfig(core_erode_ratio=ratio)
+    report = fl.apply_face_lock(
+        case["original"],
+        case["generated"],
+        case["output"],
+        detector=case["detector"],
+        config=config,
+    )
+    return case, report
+
+
+def test_core_erosion_shrinks_the_bit_exact_core_not_the_pasted_content(tmp_path: Path) -> None:
+    base_case, base = _lock_with_erosion(tmp_path, 0.0, "erodebase")
+    cut_case, cut = _lock_with_erosion(tmp_path, 0.035, "erode035")
+
+    assert base.status is fl.FaceLockStatus.APPLIED
+    assert cut.status is fl.FaceLockStatus.APPLIED
+
+    base_mask = base.diagnostics["mask"]
+    cut_mask = cut.diagnostics["mask"]
+    # The content boundary -- what gets pasted back -- is a property of the
+    # geometry and the skin test, not of the erosion.
+    assert cut_mask["pastePixels"] == base_mask["pastePixels"]
+    assert cut_mask["skinRefinement"]["coreCoverage"] == base_mask["skinRefinement"]["coreCoverage"]
+    # The erosion only moves the *bit-exact* core inwards.
+    assert cut_mask["corePixels"] < base_mask["corePixels"]
+    assert cut_mask["skinRefinement"]["coreErodePx"] > 0.0
+    assert cut_mask["skinRefinement"]["hardCorePixels"] == cut_mask["corePixels"]
+    assert "coreErodePx" not in base_mask["skinRefinement"]
+
+    # Everything still inside the eroded core is the original photograph, to
+    # the byte -- the fix must not have traded identity for smoothness.
+    assert cut.diagnostics["coreIdentity"]["maxAbsDiff"] == 0.0
+    assert cut.diagnostics["coreIdentity"]["meanAbsDiff"] == 0.0
+    assert cut_mask["corePixels"] > 12000, "the core must stay a real region"
+
+    output = np.asarray(Image.open(cut_case["output"]).convert("RGB")).astype(np.float64)
+    expected = expected_warp(cut_case).astype(np.float64)
+    generated = cut_case["generated_array"].astype(np.float64)
+    deep = region_mask(inner_region(cut_case["original_points"], fl.FACE_OVAL), 0.55)
+    assert deep.any()
+    # The centre of the face is overwhelmingly the photograph; the <=1 LSB
+    # allowance is the bilinear re-sampling ring, never the render's paint.
+    delta = np.abs(output[deep > 127] - expected[deep > 127])
+    assert delta.mean() < 0.05
+    assert delta.max() <= 1.0
+    assert np.abs(output[deep > 127] - generated[deep > 127]).mean() > 8.0
+
+
+def test_core_erosion_never_un_covers_a_facial_feature(tmp_path: Path) -> None:
+    features = {
+        "eyes": fl.EYE_A + fl.EYE_B,
+        "nose": fl.NOSE,
+        "mouth": fl.LIPS_OUTER + fl.LIPS_INNER,
+    }
+    for ratio, name in ((0.0, "guardbase"), (0.035, "guard035"), (0.070, "guard070")):
+        case, report = _lock_with_erosion(tmp_path, ratio, name)
+        assert report.status is fl.FaceLockStatus.APPLIED, (
+            f"erosion {ratio} broke the lock: {report.message}"
+        )
+        output = np.asarray(Image.open(case["output"]).convert("RGB")).astype(np.float64)
+        expected = expected_warp(case).astype(np.float64)
+        for feature, indices in features.items():
+            mask = fl.warp_mask(
+                region_mask(inner_region(case["generated_points"], indices), 0.55),
+                case["matrix"],
+                (WIDTH, HEIGHT),
+            ) > 127
+            assert mask.any(), f"{feature} fixture is empty"
+            assert np.abs(output[mask] - expected[mask]).max() == 0.0, (
+                f"erosion {ratio} exposed the render's {feature}"
+            )
+
+
+def test_harmonisation_never_touches_the_protected_core(tmp_path: Path) -> None:
+    case = happy_path_case(tmp_path, "harm")
+    config = fl.FaceLockConfig(harmonise_clamp=120.0)
+    report = fl.apply_face_lock(
+        case["original"],
+        case["generated"],
+        case["output"],
+        detector=case["detector"],
+        config=config,
+    )
+    assert report.status is fl.FaceLockStatus.APPLIED
+    assert report.diagnostics["mask"]["harmonisation"]["applied"] is True
+
+    # A huge clamp gives the tone field all the room it wants; the protected
+    # core is composited at alpha 1, so its pixels are still the photograph.
+    assert report.diagnostics["coreIdentity"]["maxAbsDiff"] == 0.0
+    assert report.diagnostics["coreIdentity"]["meanAbsDiff"] == 0.0
+
+    output = np.asarray(Image.open(case["output"]).convert("RGB")).astype(np.float64)
+    expected = expected_warp(case).astype(np.float64)
+    core = region_mask(inner_region(case["original_points"], fl.FACE_OVAL), 0.55)
+    delta = np.abs(output[core > 127] - expected[core > 127])
+    assert delta.mean() < 0.05
+    assert delta.max() <= 1.0
+
+
+def test_the_strict_lock_makes_no_network_calls(tmp_path: Path, monkeypatch) -> None:
+    import socket
+
+    case = happy_path_case(tmp_path, "offline")
+
+    def _no_connect(*args, **kwargs):  # pragma: no cover - only runs on failure
+        raise AssertionError("the strict face lock must not open a socket")
+
+    monkeypatch.setattr(socket.socket, "connect", _no_connect, raising=True)
+    monkeypatch.setattr(socket.socket, "connect_ex", _no_connect, raising=True)
+
+    report = fl.apply_face_lock(
+        case["original"], case["generated"], case["output"], detector=case["detector"]
+    )
+    assert report.status is fl.FaceLockStatus.APPLIED
+
+
+def test_the_core_erosion_budget_stays_a_small_fraction_of_the_face(tmp_path: Path) -> None:
+    default = fl.FaceLockConfig()
+    assert 0.0 < default.core_erode_ratio <= 0.05
+    # Eroding deeper than the paste feather would leave no bit-exact core at
+    # all on a small face; keep them comparable.
+    assert default.core_erode_ratio <= default.feather_ratio * 2.0
+
+
 def test_a_missing_original_face_is_rejected(tmp_path: Path) -> None:
     case = happy_path_case(tmp_path, "noorig")
     detector = MarkerDetector(

@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol, Sequence
@@ -177,6 +177,67 @@ class FaceLockConfig:
     max_seam_excess_p95: float = 24.0
     core_identity_mean_tol: float = 2.5
     core_identity_max_tol: float = 24.0
+
+    # Skin-adaptive refinement of the protection region. The protection mask is
+    # derived from the *face outline*, and on a real portrait that hull also
+    # covers the hair the subject had in the original photo (the temples, the
+    # fringe above the forehead). Pasting those pixels untouched prints the old
+    # hairstyle over the new one -- the "sticker" band along the hairline. The
+    # refinement keeps only pixels that plausibly belong to the *face*: the
+    # subject's own skin (measured against their own cheek/forehead tone, so a
+    # dark fringe is not mistaken for a warm shadow) plus the hull of the
+    # facial features, which is what carries identity.
+    skin_refine: bool = True
+    #: Luma floor as a fraction of the reference skin luma. Pixels darker than
+    #: this are hair, brows, glasses or shadow, never the skin to protect.
+    skin_y_ratio: float = 0.65
+    #: Chroma tolerance (YCrCb, 0-255 scale) around the reference skin tone.
+    skin_chroma_tolerance: float = 16.0
+    skin_close_ratio: float = 0.020
+    skin_open_ratio: float = 0.012
+    #: Grow the detected skin so thin occluders crossing it (glasses wire, the
+    #: lip line, specular highlights) are covered rather than punched out.
+    skin_grow_ratio: float = 0.030
+    #: The binary skin/feature union has a ragged, notched outline (morphology
+    #: on a noisy test). Compositing against that outline prints hard, angular
+    #: steps along the hairline. Blurring the union and re-thresholding turns it
+    #: back into the smooth curve a hairline actually is.
+    skin_smooth_ratio: float = 0.018
+    #: The skin/feature union above is the *content* boundary: inside it the
+    #: photograph is pasted back, outside it the render stands. Pinning alpha to
+    #: 1 right up to that boundary would print its ragged edge (the notches left
+    #: by morphology on textured hair) as a hard sawtooth along the hairline.
+    #: The bit-exact core -- the region that must be the original photograph to
+    #: the byte -- is therefore shaved back from that boundary by this fraction
+    #: of the face width, which leaves the existing feather free to carry the
+    #: transition. Identity is unaffected: the features are protected by their
+    #: own guard well inside this margin.
+    core_erode_ratio: float = 0.035
+    #: The feature hull is always protected, whatever the skin test says.
+    feature_guard_ratio: float = 0.020
+    #: Safety floor. If the refinement would keep less than this share of the
+    #: geometric face hull it is treated as unreliable (degenerate or stylised
+    #: input) and the unrefined geometric mask is used instead.
+    min_core_coverage: float = 0.80
+
+    # Non-generative tone harmonisation of the *generated* pixels. The styling
+    # model renders a brighter, cooler face than the photograph, so pasting the
+    # original face leaves a low-frequency tone step where it meets the new
+    # skin. This is a smooth additive field fitted on skin-like pixels around
+    # the protection boundary and applied to the generated image BEFORE
+    # compositing -- the protected core is written at alpha 1, so its pixels are
+    # bit-for-bit the original whatever this does.
+    harmonise: bool = True
+    harmonise_sigma_ratio: float = 0.080
+    harmonise_band_ratio: float = 0.180
+    harmonise_clamp: float = 26.0
+    #: The correction is confined to the render's *skin*. Darkening the new
+    #: hairstyle towards the photograph's older, dimmer lighting would (a) undo
+    #: the colour the stylist just designed and (b) *add* a step at the hairline,
+    #: where the pasted original skin meets the untouched new hair. The render's
+    #: skin sits ~25 luma from the photograph's, so the test that classifies it
+    #: is deliberately looser than the protection test.
+    harmonise_skin_tolerance_scale: float = 2.0
 
 
 def config_from_settings(settings: Any) -> FaceLockConfig:
@@ -362,12 +423,245 @@ def fill_polygon(shape: tuple[int, int], polygon: Any, value: int = 255) -> Any:
     return mask
 
 
+def _disk_kernel(radius_px: float) -> Any:
+    size = max(int(round(radius_px)), 0) * 2 + 1
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+
+
 def dilate_mask(mask: Any, radius_px: float) -> Any:
     if radius_px <= 0:
         return mask
-    size = int(round(radius_px)) * 2 + 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
-    return cv2.dilate(mask, kernel)
+    return cv2.dilate(mask, _disk_kernel(radius_px))
+
+
+def erode_mask(mask: Any, radius_px: float) -> Any:
+    if radius_px <= 0:
+        return mask
+    return cv2.erode(mask, _disk_kernel(radius_px))
+
+
+def _ycc(image_rgb: Any) -> tuple[Any, Any, Any]:
+    """YCbCr planes of an RGB image (8-bit coding range, 0-255)."""
+    f = np.asarray(image_rgb, dtype=np.float32)
+    luma = 0.299 * f[..., 0] + 0.587 * f[..., 1] + 0.114 * f[..., 2]
+    cr = 0.5 * f[..., 0] - 0.419 * f[..., 1] - 0.081 * f[..., 2] + 128.0
+    cb = -0.169 * f[..., 0] - 0.331 * f[..., 1] + 0.5 * f[..., 2] + 128.0
+    return luma, cr, cb
+
+
+#: The features that carry identity, each protected by its *own* outline.
+FEATURE_GROUPS = (EYE_A, EYE_B, BROW_A, BROW_B, NOSE, LIPS_OUTER)
+
+
+def _feature_outlines(landmarks: Any) -> list[Any]:
+    """One tight outline per facial feature.
+
+    A single hull over *all* of the features bulges across the forehead and the
+    temples -- precisely where the subject's previous fringe lives -- so pasting
+    that bulge back prints a hair-shaped wedge on the new hairline. Tight
+    outlines cover the features and nothing else; the skin around and between
+    them is handled by the skin test, which knows hair is not skin.
+    """
+    return [_convex_hull(landmarks[list(group)]) for group in FEATURE_GROUPS]
+
+
+def fill_feature_guard(shape: tuple[int, int], landmarks: Any) -> Any:
+    """Union of the identity-carrying features (eyes, brows, nose, lips)."""
+    mask = np.zeros(shape, np.uint8)
+    for outline in _feature_outlines(landmarks):
+        mask = np.maximum(mask, fill_polygon(shape, outline))
+    return mask
+
+
+def skin_reference_colour(
+    original_rgb: Any,
+    landmarks: Any,
+    face_width_px: float,
+    *,
+    erode_ratio: float = 0.10,
+    feature_ratio: float = 0.035,
+) -> tuple[Any | None, int]:
+    """Median skin colour of *this* subject, measured from their own face.
+
+    Sampling the eroded face oval minus the feature hull means the reference is
+    always the person in front of us, so the skin test below adapts to their
+    complexion and to the photo's white balance instead of assuming a fixed
+    "Caucasian portrait" skin range. Returns ``(None, 0)`` when the face is too
+    small or too stylised to sample.
+    """
+    shape = (int(original_rgb.shape[0]), int(original_rgb.shape[1]))
+    oval = fill_polygon(shape, landmarks[list(FACE_OVAL)])
+    features = dilate_mask(
+        fill_feature_guard(shape, landmarks), feature_ratio * face_width_px
+    )
+    sample = cv2.bitwise_and(
+        erode_mask(oval, erode_ratio * face_width_px), cv2.bitwise_not(features)
+    )
+    pixels = np.asarray(original_rgb)[sample > 0]
+    if pixels.shape[0] < 200:
+        return None, int(pixels.shape[0])
+    return np.median(pixels.astype(np.float32), axis=0), int(pixels.shape[0])
+
+
+def adaptive_skin_mask(
+    image_rgb: Any, reference: Any, face_width_px: float, config: FaceLockConfig
+) -> Any:
+    """Skin pixels of ``image_rgb`` judged against ``reference`` (its own face)."""
+    luma, cr, cb = _ycc(image_rgb)
+    ref_luma, ref_cr, ref_cb = _ycc(np.asarray(reference, dtype=np.float32).reshape(1, 1, 3))
+    ref_luma, ref_cr, ref_cb = float(ref_luma[0, 0]), float(ref_cr[0, 0]), float(ref_cb[0, 0])
+    tolerance = config.skin_chroma_tolerance
+    mask = (
+        (luma > config.skin_y_ratio * ref_luma)
+        & (np.abs(cr - ref_cr) <= tolerance)
+        & (np.abs(cb - ref_cb) <= tolerance)
+    ).astype(np.uint8) * 255
+    if config.skin_close_ratio > 0:
+        mask = cv2.morphologyEx(
+            mask, cv2.MORPH_CLOSE, _disk_kernel(config.skin_close_ratio * face_width_px)
+        )
+    if config.skin_open_ratio > 0:
+        mask = cv2.morphologyEx(
+            mask, cv2.MORPH_OPEN, _disk_kernel(config.skin_open_ratio * face_width_px)
+        )
+    return mask
+
+
+def generated_skin_weight(
+    generated_rgb: Any, reference: Any, face_width_px: float, config: FaceLockConfig
+) -> Any:
+    """Soft 0-1 map of the *render's* skin, used to confine the tone correction.
+
+    The render's face sits roughly 25 luma from the photograph's, so the
+    protection test's chroma tolerance is widened here (the two are the same
+    person under different lighting, not a different complexion). Blurring the
+    result keeps the correction's edge soft instead of printing a new contour
+    where the skin mask stops.
+    """
+    relaxed = replace(
+        config,
+        skin_chroma_tolerance=config.skin_chroma_tolerance
+        * max(config.harmonise_skin_tolerance_scale, 1.0),
+    )
+    mask = adaptive_skin_mask(generated_rgb, reference, face_width_px, relaxed)
+    sigma = max(0.02 * face_width_px, 0.5)
+    soft = cv2.GaussianBlur(mask.astype(np.float32) / 255.0, (0, 0), sigmaX=sigma)
+    return np.clip(soft, 0.0, 1.0)
+
+
+def protection_keep_mask(
+    original_rgb: Any,
+    landmarks: Any,
+    face_width_px: float,
+    reference: Any,
+    config: FaceLockConfig,
+) -> tuple[Any | None, dict[str, Any]]:
+    """Pixels of the original photo that may be pasted back over the render.
+
+    ``max(own_skin, feature_hull)``: the face the subject actually has, not the
+    hair they used to have. Returns ``(None, info)`` when the skin reference is
+    unusable so the caller can keep the purely geometric mask.
+    """
+    info: dict[str, Any] = {"applied": False}
+    if reference is None:
+        info["reason"] = "no reliable skin reference"
+        return None, info
+    shape = (int(original_rgb.shape[0]), int(original_rgb.shape[1]))
+    skin = adaptive_skin_mask(original_rgb, reference, face_width_px, config)
+    skin = dilate_mask(skin, config.skin_grow_ratio * face_width_px)
+    features = dilate_mask(
+        fill_feature_guard(shape, landmarks),
+        config.feature_guard_ratio * face_width_px,
+    )
+    keep = np.maximum(skin, features)
+    if config.skin_smooth_ratio > 0:
+        sigma = max(config.skin_smooth_ratio * face_width_px, 0.5)
+        info["smoothSigmaPx"] = round(sigma, 2)
+        soft = cv2.GaussianBlur(keep.astype(np.float32) / 255.0, (0, 0), sigmaX=sigma)
+        keep = (soft >= 0.5).astype(np.uint8) * 255
+    return keep, info
+
+
+def harmonise_generated(
+    generated_rgb: Any,
+    warped_original: Any,
+    soft_mask: Any,
+    reference: Any,
+    face_width_px: float,
+    config: FaceLockConfig,
+) -> tuple[Any, dict[str, Any]]:
+    """Tone-match the generated pixels to the photograph, outside the core.
+
+    The styling model returns a brighter, cooler face than the input photo, so
+    the restored original face lands next to generated skin that no longer
+    matches it. This fits a smooth *additive* correction field on the pixels
+    that are skin in both images (the only place "what should this pixel have
+    been" is well defined), then fades it out with distance from the protection
+    boundary.
+
+    The field is confined to the render's *skin*: darkening the new hairstyle
+    towards the photograph's lighting would both undo the designed hair colour
+    and print a fresh step at the hairline, where the untouched pasted skin
+    meets the darkened hair.
+
+    It is purely tonal -- no geometry, no texture synthesis -- and it is applied
+    to the generated image *before* compositing. Protected core pixels are
+    written at alpha 1, so they never change.
+    """
+    stats: dict[str, Any] = {"applied": False}
+    if not config.harmonise or reference is None:
+        stats["reason"] = "disabled" if not config.harmonise else "no skin reference"
+        return generated_rgb, stats
+
+    generated = np.asarray(generated_rgb, dtype=np.float32)
+    warped = np.asarray(warped_original, dtype=np.float32)
+    distance = cv2.distanceTransform((soft_mask < 0.5).astype(np.uint8), cv2.DIST_L2, 5)
+    near = distance <= config.harmonise_band_ratio * face_width_px
+    target_skin = generated_skin_weight(
+        generated_rgb, reference, face_width_px, config
+    )
+    both_skin = (
+        (adaptive_skin_mask(warped_original, reference, face_width_px, config) > 0)
+        & (adaptive_skin_mask(generated_rgb, reference, face_width_px, config) > 0)
+    )
+    valid = (near & both_skin).astype(np.float32)
+    count = int(valid.sum())
+    stats["samplePixels"] = count
+    if count < 50:
+        stats["reason"] = "not enough matching skin samples"
+        return generated_rgb, stats
+
+    difference = warped - generated
+    median = np.median(difference[valid > 0], axis=0)
+    # The median *is* the tone step this exists to remove: the render's skin is
+    # brighter/cooler than the photograph's by exactly that much, and pasting
+    # the photo next to it prints the step. Keep the median and clip the
+    # excursions around it (specular highlights, the model's new jewellery).
+    limited = np.clip(difference, median - 18.0, median + 18.0) * valid[..., None]
+    sigma = max(config.harmonise_sigma_ratio * face_width_px, 0.5)
+    blurred = cv2.GaussianBlur(limited, (0, 0), sigmaX=sigma)
+    weight = cv2.GaussianBlur(valid, (0, 0), sigmaX=sigma)[..., None]
+    correction = blurred / np.maximum(weight, 1e-3)
+    taper = np.exp(-((distance / max(config.harmonise_band_ratio * face_width_px, 1.0)) ** 2))
+    limited_field = np.clip(
+        correction, -config.harmonise_clamp, config.harmonise_clamp
+    )
+    applied = limited_field * taper[..., None] * target_skin[..., None]
+    stats.update(
+        {
+            "applied": True,
+            "medianDifference": [round(float(value), 2) for value in median],
+            "appliedAbsMean": round(float(np.abs(applied).mean()), 3),
+            "appliedAbsMeanNearFace": round(
+                float(np.abs(applied)[near].mean()), 3
+            )
+            if near.any()
+            else 0.0,
+            "skinPixelsNearFace": int((near & (target_skin > 0.5)).sum()),
+            "clamp": config.harmonise_clamp,
+        }
+    )
+    return np.clip(generated + applied, 0.0, 255.0), stats
 
 
 def gaussian_mask(mask: Any, sigma_px: float) -> Any:
@@ -721,6 +1015,51 @@ def _lock_and_render(
         coverage_mask, config.paste_dilate_ratio * orig_face_width
     )
 
+    # The face outline also covers whatever the subject *had* there in the
+    # original photo -- for a long-haired subject that is their old fringe and
+    # temples. Pasting those pixels over the new hairstyle is what prints the
+    # "sticker" band along the hairline; keep only the subject's own face.
+    skin_reference, skin_samples = skin_reference_colour(
+        original_rgb, orig_face, orig_face_width
+    )
+    keep_info: dict[str, Any] = {"samplePixels": int(skin_samples), "applied": False}
+    if skin_reference is not None:
+        keep_info["referenceColour"] = [int(round(float(value))) for value in skin_reference]
+    if config.skin_refine and skin_reference is not None:
+        keep_mask, keep_detail = protection_keep_mask(
+            original_rgb, orig_face, orig_face_width, skin_reference, config
+        )
+        keep_info.update({k: v for k, v in keep_detail.items() if k != "applied"})
+        if keep_mask is not None:
+            refined_core = cv2.bitwise_and(core_mask, keep_mask)
+            keep_ratio = float((refined_core > 0).sum()) / max(
+                float((core_mask > 0).sum()), 1.0
+            )
+            keep_info["coreCoverage"] = round(keep_ratio, 4)
+            keep_info["minCoreCoverage"] = config.min_core_coverage
+            if keep_ratio >= config.min_core_coverage:
+                keep_info["droppedPastePixels"] = int(
+                    ((paste_mask > 0) & (keep_mask == 0)).sum()
+                )
+                paste_mask = cv2.bitwise_and(paste_mask, keep_mask)
+                hard_core = refined_core
+                if config.core_erode_ratio > 0:
+                    hard_core = erode_mask(
+                        refined_core, config.core_erode_ratio * orig_face_width
+                    )
+                    keep_info["coreErodePx"] = round(
+                        config.core_erode_ratio * orig_face_width, 2
+                    )
+                    keep_info["hardCorePixels"] = int((hard_core > 0).sum())
+                core_mask = hard_core
+                keep_info["applied"] = True
+            else:
+                keep_info["reason"] = "refined core below the coverage floor"
+    elif not config.skin_refine:
+        keep_info["reason"] = "disabled"
+    else:
+        keep_info["reason"] = "no reliable skin reference"
+
     # A hand-painted mask (glasses frame, an awkward fringe, a landmark the
     # detector placed badly) is treated as *core*: the pixels there are the
     # original photograph at full opacity, never a feathered blend.
@@ -753,6 +1092,12 @@ def _lock_and_render(
     # the model's pixels would bleed back in. Pin the core to the original at
     # full opacity -- the protected pixels are the original photograph, exactly.
     soft_gen = np.maximum(soft_gen, core_gen.astype(np.float32))
+
+    # Tone-match the generated side of the boundary to the photograph. Applied
+    # before compositing, so the alpha-1 core below is unaffected by design.
+    generated_rgb, harmonise_stats = harmonise_generated(
+        generated_rgb, warped_original, soft_gen, skin_reference, orig_face_width, config
+    )
 
     alpha = soft_gen[..., None]
     composite = warped_original.astype(np.float32) * alpha + generated_rgb.astype(np.float32) * (
@@ -839,6 +1184,8 @@ def _lock_and_render(
                     "path": str(manual_mask_path) if manual_mask_path else None,
                     "pixels": int((manual_mask > 0).sum()) if manual_mask is not None else 0,
                 },
+                "skinRefinement": keep_info,
+                "harmonisation": harmonise_stats,
             },
             "seam": {
                 "bandPixels": int(band.sum()),
