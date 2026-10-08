@@ -53,3 +53,11 @@ evidence/p29-live-run/*.json
 # written up in evidence/p29-fix-run-report.md; keep only the derived stats.
 evidence/p29-fix-run/*
 !evidence/p29-fix-run/accept_stats.json
+
+# P2.9 neck / hairline / collar revision: the before/after renders, the cached
+# SCHP label map and the zoom crops all reproduce the subject's own photo, so
+# they stay local-only. The write-up is evidence/p29-neck-fix-report.md; keep
+# the derived stats and the offline probe scripts, which hold no image data.
+evidence/p29-neck-fix/*
+!evidence/p29-neck-fix/*.json
+!evidence/p29-neck-fix/*.py

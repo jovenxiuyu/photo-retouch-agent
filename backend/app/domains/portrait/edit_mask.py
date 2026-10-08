@@ -79,6 +79,7 @@ from app.domains.portrait.face_lock import (
     FaceLockConfig,
     adaptive_skin_mask,
     dilate_mask,
+    erode_mask,
     face_width,
     fill_feature_guard,
     fill_polygon,
@@ -336,9 +337,31 @@ class SemanticMaskConfig:
     #: "not locked inside the old hair" allowance: a bounded rim around the real
     #: silhouette, not a head-sized ellipse.
     hair_grow_ratio: float = 0.12
+    #: How far that rim may reach *over a parsed garment*. The wide rim above is
+    #: right on the background side of the silhouette, but on the clothes side it
+    #: let the hair pass repaint a collar's worth of pixels and then hand the
+    #: same pixels to the clothing pass -- two passes over one seam, which is
+    #: what printed the pale ghost below the chin. Over a garment the rim is
+    #: tightened to this ratio, so only a hair's-breadth of overhang can
+    #: repaint cloth and the hair/clothing boundary stays a single clean line.
+    hair_rim_over_clothing_ratio: float = 0.02
     #: How far a *new* garment may reach outside the parsed one, so a collar or
     #: a shoulder line can move without opening the background or the arms.
     clothing_grow_ratio: float = 0.06
+    #: Clear air the garment keeps from the parsed hair. The garment is grown
+    #: for a new collar/shoulder line and then this band is taken back out, so
+    #: at zero the clothing mask stops exactly on the parse's own hair boundary
+    #: and the hair lying on the clothes is owned by the hair pass alone instead
+    #: of being repainted by both passes.
+    clothing_hair_clearance_ratio: float = 0.0
+    #: Freed from the face guard before it is shipped: the parsed hair is eroded
+    #: by this ratio and subtracted from the protected island, so the subject's
+    #: own fringe is repainted with the new hairstyle instead of being frozen as
+    #: a dark band under it. At zero the whole parsed fringe is released, which
+    #: is safe here because a class map never puts one pixel in both ``Hair``
+    #: and ``Face``: no parsed skin pixel can be freed, only parsed hair. Raise
+    #: it only if a parse is seen spilling a few pixels of hair onto bare brow.
+    hair_guard_release_erode_ratio: float = 0.0
     #: Soft transition allowed where an editable region meets a kept region.
     feather_ratio: float = 0.020
     #: Below this a "region" is speckle; it is dropped and reported instead.
@@ -358,6 +381,12 @@ class SemanticMaskConfig:
     #: Below this many pixels the non-skin mass below the chin is treated as
     #: noise rather than as a collar, and the parsed island is kept whole.
     collar_min_pixels: int = 64
+    #: A below-chin ``Face`` pixel that is not skin *and* is darker than this
+    #: share of the subject's own skin luminance is a shadowed throat, not a
+    #: collar, and is protected rather than carved. Without it the darkest
+    #: shadow under the jaw was handed to the garment and repainted, which is
+    #: what left the grey cast on the underside of the chin.
+    collar_skin_luma_ratio: float = 0.35
 
 
 def build_semantic_edit_masks(
@@ -460,6 +489,7 @@ def build_semantic_edit_masks(
     collar = np.zeros(shape, np.uint8)
     collar_pixels = 0
     neck_skin_pixels = 0
+    dark_throat_pixels = 0
     collar_split_applied = False
     if cfg.collar_split_enabled:
         chin_y = float(lm[CHIN][1]) + cfg.collar_margin_ratio * face_w
@@ -482,6 +512,27 @@ def build_semantic_edit_masks(
                 candidate = cv2.bitwise_and(
                     below_face, cv2.bitwise_not(skin_mask)
                 )
+                # A shadowed throat is skin that the chroma tolerance rejects;
+                # the darkest pixels under the jaw are that shadow, not cloth.
+                # Handing them to the garment is what let a pass repaint the
+                # underside of the chin, so they go back to the guard and are
+                # counted as neck skin, not as a collar.
+                if cfg.collar_skin_luma_ratio > 0:
+                    luma = _luma(image)
+                    ref_luma = float(
+                        _luma(
+                            np.asarray(reference, dtype=np.float32).reshape(1, 1, 3)
+                        )[0, 0]
+                    )
+                    dark = np.where(
+                        luma < cfg.collar_skin_luma_ratio * ref_luma, 255, 0
+                    ).astype(np.uint8)
+                    dark = cv2.bitwise_and(dark, below_face)
+                    dark_throat_pixels = int(
+                        (cv2.bitwise_and(candidate, dark) > 0).sum()
+                    )
+                    candidate = cv2.bitwise_and(candidate, cv2.bitwise_not(dark))
+                    neck_skin_pixels += dark_throat_pixels
                 candidate_pixels = int((candidate > 0).sum())
                 if candidate_pixels >= cfg.collar_min_pixels:
                     collar = candidate
@@ -494,6 +545,13 @@ def build_semantic_edit_masks(
                         f"(< {cfg.collar_min_pixels}), too small to be a collar; the "
                         "parsed face/neck island was protected whole"
                     )
+
+    # The parsed hair is needed before the guard is closed: the subject's own
+    # fringe lies *inside* the face oval, and unioning the oval in without
+    # carving the hair back out froze that fringe as a dark band under the new
+    # hairline -- the double edge a paid run printed on the forehead.
+    parsed_hair = _class_mask(labels, (HAIR,))
+    parsed_hair, hair_cleanup = _drop_speckle(parsed_hair, cfg)
 
     face_core = cv2.bitwise_and(parsed_face, cv2.bitwise_not(collar))
     oval = fill_polygon(shape, _hull(lm[list(FACE_OVAL)]))
@@ -510,6 +568,19 @@ def build_semantic_edit_masks(
     protected_face = cv2.bitwise_and(
         dilate_mask(island, cfg.face_grow_ratio * face_w),
         cv2.bitwise_not(collar),
+    )
+    # The fringe, eroded a hair's breadth. Eroding keeps a parse that spills a
+    # few pixels onto the brow from opening bare forehead skin to the
+    # generator, while still releasing the bulk of the fringe so the hair pass
+    # can lay a new hairline over it instead of printing the old one.
+    hair_guard_release = erode_mask(
+        parsed_hair, cfg.hair_guard_release_erode_ratio * face_w
+    )
+    guard_release_pixels = int(
+        (cv2.bitwise_and(protected_face, hair_guard_release) > 0).sum()
+    )
+    protected_face = cv2.bitwise_and(
+        protected_face, cv2.bitwise_not(hair_guard_release)
     )
 
     # The subject's own skin tone is also kept as a quality signal on the parse
@@ -533,28 +604,45 @@ def build_semantic_edit_masks(
     #    bounded rim so a longer, fuller or differently shaped hairstyle is
     #    allowed, then cut back by the face guard so the forehead and jaw
     #    cannot be repainted.
-    parsed_hair = _class_mask(labels, (HAIR,))
-    parsed_hair, hair_cleanup = _drop_speckle(parsed_hair, cfg)
-    hair = cv2.bitwise_and(
+    #    The rim is asymmetric: over the background it stays wide (a new
+    #    silhouette must be free to grow), but over a parsed garment it is
+    #    tightened, because a wide rim there handed the hair pass a band of
+    #    collar to repaint and then the clothing pass repainted it again.
+    parsed_clothing = _class_mask(labels, CLOTHING_CLASSES)
+    parsed_clothing, clothing_cleanup = _drop_speckle(parsed_clothing, cfg)
+    if collar_split_applied:
+        parsed_clothing = np.maximum(parsed_clothing, collar)
+    hair_over_background_rim = cv2.bitwise_and(
         dilate_mask(parsed_hair, cfg.hair_grow_ratio * face_w),
+        cv2.bitwise_not(parsed_clothing),
+    )
+    hair_over_clothing_rim = cv2.bitwise_and(
+        dilate_mask(parsed_hair, cfg.hair_rim_over_clothing_ratio * face_w),
+        parsed_clothing,
+    )
+    hair = cv2.bitwise_and(
+        np.maximum(hair_over_background_rim, hair_over_clothing_rim),
         cv2.bitwise_not(protected),
     )
 
     # 5. Clothing: the parsed garment(s) with their speckle dropped, grown a
     #    little for a new collar and shoulder line, minus everything protected
     #    (so skin, the neck and the face survive a garment swap).
-    parsed_clothing = _class_mask(labels, CLOTHING_CLASSES)
-    parsed_clothing, clothing_cleanup = _drop_speckle(parsed_clothing, cfg)
-    # The collar carved out of the parsed face joins the garment region, which
-    # is the whole point of the split: on the old mask it was frozen with the
-    # face, so a new outfit could never reach the neckline. It is merged *after*
-    # the speckle filter because it is geometry this module measured, not a
-    # parsed island to prune.
-    if collar_split_applied:
-        parsed_clothing = np.maximum(parsed_clothing, collar)
-    clothing = cv2.bitwise_and(
+    #    The collar carved out of the parsed face joined the garment region
+    #    above, which is the whole point of the split: on the old mask it was
+    #    frozen with the face, so a new outfit could never reach the neckline.
+    #    Hair lying *on* the clothes is subtracted back out, so the two passes
+    #    tile the seam instead of both repainting it: clothing owns the cloth,
+    #    the hair pass -- which runs second and therefore has the final say --
+    #    owns the strands and the thin overhang they cast on it.
+    clothing_owner = cv2.bitwise_and(
         dilate_mask(parsed_clothing, cfg.clothing_grow_ratio * face_w),
-        cv2.bitwise_not(protected),
+        cv2.bitwise_not(
+            dilate_mask(parsed_hair, cfg.clothing_hair_clearance_ratio * face_w)
+        ),
+    )
+    clothing = cv2.bitwise_and(
+        clothing_owner, cv2.bitwise_not(protected)
     )
 
     # 6. Drop speckle regions instead of shipping a mask that looks broken.
@@ -645,10 +733,21 @@ def build_semantic_edit_masks(
         "collarSplitEnabled": bool(cfg.collar_split_enabled),
         "collarSplitApplied": bool(collar_split_applied),
         "collarReclassifiedPixels": int(collar_pixels),
+        "collarDarkThroatPixels": int(dark_throat_pixels),
         "collarEditablePixels": int(
             (cv2.bitwise_and(collar, editable) > 0).sum()
         ),
         "neckSkinProtectedPixels": int(neck_skin_pixels),
+        "hairGuardReleasePixels": int(guard_release_pixels),
+        "hairFrozenByGuardPixels": int(
+            (cv2.bitwise_and(protected, parsed_hair) > 0).sum()
+        ),
+        "hairOverClothingRimPixels": int(
+            (cv2.bitwise_and(hair, parsed_clothing) > 0).sum()
+        ),
+        "clothingOverParsedHairPixels": int(
+            (cv2.bitwise_and(clothing, parsed_hair) > 0).sum()
+        ),
         "faceSkinShare": round(face_skin_pixels / island_pixels, 4),
         "backgroundPreservePixels": int((background_preserve > 0).sum()),
         "backgroundEditablePixels": background_editable,
@@ -695,6 +794,16 @@ def _class_mask(labels: Any, classes: tuple[int, ...]) -> Any:
     for class_id in classes:
         mask[labels == class_id] = 255
     return mask
+
+
+def _luma(image_rgb: Any) -> Any:
+    """Rec.601 luminance of an RGB image, in the 8-bit coding range.
+
+    The same coefficients :func:`~app.domains.portrait.face_lock._ycc` uses, so
+    the collar's shadow test agrees with the skin test that rejected the pixel.
+    """
+    f = np.asarray(image_rgb, dtype=np.float32)
+    return 0.299 * f[..., 0] + 0.587 * f[..., 1] + 0.114 * f[..., 2]
 
 
 def _drop_speckle(

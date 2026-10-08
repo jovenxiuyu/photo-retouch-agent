@@ -169,6 +169,27 @@ def test_negative_prompt_excludes_every_artefact_the_failed_run_produced():
         assert term in negative
 
 
+def test_clothing_prompt_pins_a_closed_collar_and_rules_out_a_deep_v():
+    """Both runs opened the neckline; "shirt" was not enough of an instruction."""
+    prompts = rh.build_prompts(_bundle())
+
+    assert rh.COLLAR_CLAUSE in prompts["clothing"]
+    assert "collar" in prompts["clothing"].lower()
+    assert "collarbone" in prompts["clothing"].lower()
+    for term in rh.COLLAR_NEGATIVE_TERMS:
+        assert term in prompts["negative"]
+    assert "deep v neck" in prompts["negative"]
+    assert "exposed chest" in prompts["negative"]
+    assert "sheer mesh shoulder" in prompts["negative"]
+    assert "statement necklace" in prompts["negative"]
+
+
+def test_the_collar_clause_does_not_smuggle_a_facial_feature_back_in():
+    prompts = rh.build_prompts(_bundle())
+
+    assert rh.FORBIDDEN_POSITIVE_PATTERN.search(prompts["clothing"]) is None
+
+
 def test_build_prompts_refuses_a_bundle_from_another_style():
     """``artistic_wave`` is the neighbouring axis and must not slip in as the plan."""
     with pytest.raises(SystemExit):
@@ -237,6 +258,27 @@ def test_hair_pass_consumes_the_clothing_pass_stitch():
     assert workflow["19"]["inputs"]["images"] == ["18", 0]
 
 
+def test_each_pass_leaves_a_stage_record_without_extra_sampling():
+    """A pale band under the chin has to be attributable to one pass afterwards.
+
+    Node 20 saves the clothing pass's own stitch; node 19 saves the finished
+    frame. Both read nodes that already exist, so the graph still samples exactly
+    twice -- a diagnostic must never add a second generation.
+    """
+    workflow = _workflow()
+
+    assert workflow["20"]["class_type"] == "SaveImage"
+    assert workflow["20"]["inputs"]["images"] == ["10", 0]
+    assert workflow["19"]["inputs"]["images"] == ["18", 0]
+
+    saves = [nid for nid, node in workflow.items() if node["class_type"] == "SaveImage"]
+    assert sorted(saves) == ["19", "20"]
+    samplers = [nid for nid, node in workflow.items() if node["class_type"] == "KSampler"]
+    assert sorted(samplers) == ["16", "8"]
+    decodes = [nid for nid, node in workflow.items() if node["class_type"] == "VAEDecode"]
+    assert sorted(decodes) == ["17", "9"]
+
+
 def test_workflow_diff_reports_the_conditioning_swap():
     """The report has to show the fix, not just the finished graph."""
     before = {"7": {"class_type": "VAEEncodeForInpaint",
@@ -267,6 +309,10 @@ def test_gate_passes_on_a_package_without_any_api_key(tmp_path):
     assert report["style_id_matches_plan"] is True
     assert report["prompt_has_plan_phrases"] is True
     assert report["negative_prompt_terms_ok"] is True
+    assert report["collar_clause_ok"] is True
+    assert report["collar_negative_terms_ok"] is True
+    assert report["stage_records"]["clothing_pass"] == ["20"]
+    assert report["stage_records"]["final"] == ["19"]
     assert all(size == (256, 320) for size in report["image_sizes"].values())
 
 

@@ -66,6 +66,15 @@ COLLAR_COLS = (120, 240)
 NECK_COLS = (170, 200)
 COLLAR_COLOUR = np.array([232, 238, 248], dtype=np.uint8)
 
+#: The real mesh keeps these on the bridge of the nose and at the outer corners
+#: of the eyes. The synthetic ``FACE_OVAL`` ring above reuses the very same
+#: indices, so they are pinned back to eye height afterwards: without that the
+#: glasses hull is the convex hull of the whole oval and the "lens band" guard
+#: swallows the forehead, which is a fixture artefact and not the real guard.
+GLASSES_BRIDGE = (5, 4, 6, 168, 195, 197)
+GLASSES_SIDES_LEFT = (127, 234, 93)
+GLASSES_SIDES_RIGHT = (356, 454, 323)
+
 
 def _ring(points: np.ndarray, indices, center, rx: float, ry: float) -> None:
     count = len(indices)
@@ -90,6 +99,12 @@ def _landmarks() -> np.ndarray:
     _ring(points, NOSE, (FACE_CX, FACE_CY + 8.0), 8.0, 14.0)
     _ring(points, LIPS_INNER, (FACE_CX, FACE_CY + 44.0), 12.0, 6.0)
     points[CHIN] = [FACE_CX, FACE_CY + FACE_RY]
+    for index in GLASSES_BRIDGE:
+        points[index] = [FACE_CX, FACE_CY - 26.0]
+    for index in GLASSES_SIDES_LEFT:
+        points[index] = [FACE_CX - 40.0, FACE_CY - 22.0]
+    for index in GLASSES_SIDES_RIGHT:
+        points[index] = [FACE_CX + 40.0, FACE_CY - 22.0]
     return points
 
 
@@ -208,10 +223,136 @@ def test_glasses_band_is_protected_from_geometry(mask_set):
     assert "glasses_guard_is_geometric" in " ".join(mask_set.gaps)
 
 
+def test_the_synthetic_lens_band_is_a_band_and_not_the_whole_oval(mask_set):
+    """The pinned indices keep the fixture honest about the real guard."""
+    pinned = set(GLASSES_BRIDGE + GLASSES_SIDES_LEFT + GLASSES_SIDES_RIGHT)
+    assert pinned <= set(GLASSES_BAND)
+    # A degenerate hull would make the oval itself the guard and freeze the
+    # whole forehead, so the band must stay a small share of the parsed face.
+    assert mask_set.stats["glassesGuardPixels"] < 0.35 * mask_set.stats[
+        "parsedFacePixels"
+    ]
+
+
 def test_a_new_hairstyle_may_reach_outside_the_parsed_hair(mask_set):
     parsed = _class_mask(_labels(), HAIR)
     rim = cv2.bitwise_and(mask_set.hair, cv2.bitwise_not(parsed))
     assert int((rim > 0).sum()) > 0
+
+
+def _hair_lying_on_a_garment():
+    """Hair with a garment directly beneath it: the seam that printed the ghost.
+
+    The base layout keeps hair and garment far apart, so a stray rim cannot be
+    seen. Here the parsed garment starts on the row the hair ends, which is the
+    geometry the pale band under the chin came from: a wide rim handed the hair
+    pass a band of collar and the clothing pass repainted it afterwards.
+    """
+    hair_rows, hair_cols = (40, 118), (270, 350)
+    garment_rows, garment_cols = (118, 320), (270, 350)
+    labels = np.full((IMAGE_HEIGHT, IMAGE_WIDTH), BACKGROUND, dtype=np.uint8)
+    labels[hair_rows[0] : hair_rows[1], hair_cols[0] : hair_cols[1]] = HAIR
+    labels[garment_rows[0] : garment_rows[1], garment_cols[0] : garment_cols[1]] = UPPER_CLOTHES
+    labels[FACE_ROWS[0] : FACE_ROWS[1], FACE_COLS[0] : FACE_COLS[1]] = FACE
+    return _image(), labels
+
+
+def test_the_hair_rim_is_tightened_where_it_overlaps_a_garment():
+    """The wide rim is for the background. Over cloth it is pulled right in.
+
+    Both variants are the same scene and the same builder; the only difference
+    is the rim allowed over a parsed garment, so the pixels *taken* from the
+    garment are attributable to that one knob.
+    """
+    image, labels = _hair_lying_on_a_garment()
+    tight = build_semantic_edit_masks(image, _landmarks(), labels)
+    wide = build_semantic_edit_masks(
+        image,
+        _landmarks(),
+        labels,
+        config=SemanticMaskConfig(
+            hair_rim_over_clothing_ratio=SemanticMaskConfig().hair_grow_ratio
+        ),
+    )
+
+    assert tight.stats["hairOverClothingRimPixels"] > 0
+    assert tight.stats["hairOverClothingRimPixels"] < wide.stats["hairOverClothingRimPixels"]
+    # A hair's breadth of overhang is still allowed, so the seam is not a hard cut.
+    assert tight.stats["hairOverClothingRimPixels"] < 0.25 * wide.stats[
+        "hairOverClothingRimPixels"
+    ]
+
+
+def test_clothing_never_reaches_back_over_the_parsed_hair():
+    """One pass owns the seam: the garment stops at the parse, the hair laps it.
+
+    The hair pass runs second, so it -- not the garment -- has the final say on
+    the strand-on-cloth seam. The garment is carved back to the parsed hair
+    boundary and never repaints a strand. To keep that zero from being vacuous
+    (two masks that simply never touch) the same scene is asserted to have the
+    hair pass reaching over the cloth, and a wider clearance is checked to only
+    ever take pixels *away* from the garment.
+    """
+    image, labels = _hair_lying_on_a_garment()
+    parsed_hair = _class_mask(labels, HAIR)
+    parsed_clothing = _class_mask(labels, UPPER_CLOTHES)
+    default = build_semantic_edit_masks(image, _landmarks(), labels)
+
+    assert default.stats["clothingOverParsedHairPixels"] == 0
+    assert int((cv2.bitwise_and(default.clothing, parsed_hair) > 0).sum()) == 0
+    # The seam is real and owned by exactly one pass: hair paints over cloth.
+    assert int((cv2.bitwise_and(default.hair, parsed_clothing) > 0).sum()) > 0
+
+    wider = build_semantic_edit_masks(
+        image,
+        _landmarks(),
+        labels,
+        config=SemanticMaskConfig(clothing_hair_clearance_ratio=0.06),
+    )
+    assert wider.stats["clothingOverParsedHairPixels"] == 0
+    assert int((cv2.bitwise_and(wider.clothing, parsed_hair) > 0).sum()) == 0
+    assert wider.stats["clothingPixels"] <= default.stats["clothingPixels"]
+
+
+def _fringe_scene():
+    """The subject's own dark fringe lying inside the face oval.
+
+    This is the real photo's geometry: MediaPipe's oval reaches over the hair,
+    so unioning the oval in without carving the parse back out froze the fringe
+    and printed a second hairline under the new one.
+    """
+    labels = np.full((IMAGE_HEIGHT, IMAGE_WIDTH), BACKGROUND, dtype=np.uint8)
+    labels[FACE_ROWS[0] : FACE_ROWS[1], FACE_COLS[0] : FACE_COLS[1]] = FACE
+    labels[105:155, 140:220] = HAIR
+    return _image(), labels
+
+
+def test_the_parsed_fringe_is_released_so_a_new_hairline_has_one_edge():
+    image, labels = _fringe_scene()
+    released = build_semantic_edit_masks(image, _landmarks(), labels)
+    frozen = build_semantic_edit_masks(
+        image,
+        _landmarks(),
+        labels,
+        config=SemanticMaskConfig(hair_guard_release_erode_ratio=0.30),
+    )
+
+    # By default the parsed fringe comes out of the face guard, so the hair pass
+    # paints a new hairline over it instead of leaving the old one underneath.
+    assert released.stats["hairGuardReleasePixels"] > 0
+    assert released.stats["hairFrozenByGuardPixels"] == 0
+    # Only the parsed hair can be freed, never parsed skin, so the guard still
+    # cannot be punched open.
+    assert released.stats["protectedCoversEditable"] is True
+    assert released.stats["identityCoversEditable"] is True
+    # Turning the release down to a large erode is the old behaviour -- the
+    # fringe stays inside the guard -- and it shows up as frozen hair under the
+    # new hairline: the double edge. The knob has to move it, so the release is
+    # strictly smaller and the frozen fringe comes back.
+    assert frozen.stats["hairGuardReleasePixels"] < released.stats[
+        "hairGuardReleasePixels"
+    ]
+    assert frozen.stats["hairFrozenByGuardPixels"] > 0
 
 
 def test_face_skin_share_is_reported_as_a_quality_signal(mask_set):
@@ -388,3 +529,39 @@ def test_collar_split_reports_when_no_skin_tone_can_be_sampled():
     collar_col = COLLAR_COLS[0] + 10
     assert result.editable[collar_row, collar_col] == 0
     assert result.protected[collar_row, collar_col] == 255
+
+
+def _shadowed_throat_image() -> np.ndarray:
+    """The same band, but the garment is in deep shadow under the jaw.
+
+    The shadow fails the chroma skin test the same way a dark garment does, so
+    without a luminance floor it was carved out as cloth and repainted -- the
+    grey cast on the underside of the chin.
+    """
+    image = _collar_image().copy()
+    image[
+        COLLAR_ROWS[0] : COLLAR_ROWS[1], COLLAR_COLS[0] : COLLAR_COLS[1]
+    ] = np.array([40, 36, 42], dtype=np.uint8)
+    image[COLLAR_ROWS[0] : COLLAR_ROWS[1], NECK_COLS[0] : NECK_COLS[1]] = SKIN
+    return image
+
+
+def test_a_shadowed_throat_stays_protected_instead_of_becoming_a_collar():
+    bright = build_semantic_edit_masks(_collar_image(), _landmarks(), _collar_labels())
+    shadow = build_semantic_edit_masks(
+        _shadowed_throat_image(), _landmarks(), _collar_labels()
+    )
+
+    # A genuinely white collar has no dark pixels to reclaim.
+    assert bright.stats["collarDarkThroatPixels"] == 0
+    assert bright.stats["collarEditablePixels"] > 0
+
+    # A shadowed band is claimed back as neck skin, so nothing is carved and the
+    # island is protected whole rather than handed to the garment.
+    assert shadow.stats["collarDarkThroatPixels"] > 0
+    assert shadow.stats["collarReclassifiedPixels"] == 0
+    assert shadow.stats["collarSplitApplied"] is False
+    collar_row = COLLAR_ROWS[0] + 5
+    collar_col = COLLAR_COLS[0] + 10
+    assert shadow.editable[collar_row, collar_col] == 0
+    assert shadow.protected[collar_row, collar_col] == 255

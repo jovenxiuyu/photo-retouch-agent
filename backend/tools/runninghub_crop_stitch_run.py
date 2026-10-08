@@ -150,6 +150,30 @@ GLASSES_CLAUSE = "replace the current round thin metal-frame glasses"
 # not cover, so it is dropped the same way.
 NECKLACE_CLAUSE = "worn with a slim metal necklace"
 
+# The plan names a *shirt*, and a shirt alone left the sampler free to open the
+# neckline: both billed runs came back with a deep V and an exposed chest, which
+# the plan's own silhouette explicitly forbids. The neckline is therefore pinned
+# on the positive side as well -- a higher natural collar closed near the
+# collarbone, with the vintage folds the plan asks for -- so "follow the existing
+# garment" does not read as "open the front".
+COLLAR_CLAUSE = (
+    "a higher natural collar closed near the collarbone with fine pleats and "
+    "soft vintage folds"
+)
+
+# The neckline artefacts the plan rules out, carried as negative terms so the
+# sampler is pushed away from an open front even where the mask leaves the
+# neckline editable. These are hints only: the mask and the original-crop
+# conditioning are what actually hold the silhouette.
+COLLAR_NEGATIVE_TERMS = (
+    "deep v neck",
+    "plunging neckline",
+    "exposed chest",
+    "bare cleavage",
+    "sheer mesh shoulder",
+    "statement necklace",
+)
+
 # ``hair_prompt`` names the hair being replaced. At denoise below 1.0 a
 # description of the input biases the model toward keeping it, so only the
 # target colour is kept.
@@ -298,22 +322,26 @@ def build_prompts(bundle: dict) -> dict:
     clothing = _target_half(bundle["clothing_prompt"], CLOTHING_TARGET_MARKER, "clothing")
     clothing, necklace_dropped = _drop_clause(clothing, NECKLACE_CLAUSE)
     clothing, glasses_dropped = _drop_clause_through(clothing, GLASSES_CLAUSE)
-    clothing = f"{clothing.rstrip(' .,;')}, {CLOTHING_TARGET_SUFFIX}"
+    clothing = (
+        f"{clothing.rstrip(' .,;')}, {CLOTHING_TARGET_SUFFIX}, {COLLAR_CLAUSE}"
+    )
 
     hair = _target_half(bundle["hair_prompt"], HAIR_TARGET_MARKER, "hair")
     hair, current_hair_dropped = _drop_clause(hair, CURRENT_HAIR_CLAUSE)
     hair = f"{hair.rstrip(' .,;')}, {HAIR_TARGET_SUFFIX}"
 
+    negative = f"{NEGATIVE_PROMPT}, {', '.join(COLLAR_NEGATIVE_TERMS)}"
     rule = _plan_mask_rule(bundle)
     prompts = {
         "style_id": style_id,
         "style_name": bundle.get("style_name"),
         "clothing": f"{clothing} {rule}",
         "hair": f"{hair} {rule}",
-        "negative": NEGATIVE_PROMPT,
+        "negative": negative,
         "glasses_clause_dropped": glasses_dropped,
         "necklace_clause_dropped": necklace_dropped,
         "current_hair_clause_dropped": current_hair_dropped,
+        "collar_clause": COLLAR_CLAUSE,
         "mask_rule": rule,
     }
 
@@ -327,6 +355,11 @@ def build_prompts(bundle: dict) -> dict:
     missing = [term for term in REQUIRED_NEGATIVE_TERMS if term not in prompts["negative"]]
     if missing:
         raise SystemExit(f"negative prompt is missing {missing}")
+    missing_collar = [term for term in COLLAR_NEGATIVE_TERMS if term not in prompts["negative"]]
+    if missing_collar:
+        raise SystemExit(f"negative prompt is missing the neckline terms {missing_collar}")
+    if COLLAR_CLAUSE not in prompts["clothing"]:
+        raise SystemExit("clothing prompt lost the closed-collar clause")
     for kind in ("clothing", "hair"):
         denoise = PASS_DENOISE[kind]
         if not DENOISE_BAND[0] <= denoise <= DENOISE_BAND[1]:
@@ -434,6 +467,17 @@ def build_workflow(package: Path, filenames: dict[str, str], prompts: dict, seed
             "inputs": {"stitcher": ["12", 0], "inpainted_image": ["17", 0]},
         },
         "19": {"class_type": "SaveImage", "inputs": {"images": ["18", 0], "filename_prefix": "p29_elegant"}},
+        # Stage record for the two-pass replay. Node 19 is the finished frame;
+        # this second save is the clothing pass's own stitch, captured before the
+        # hair pass runs. Both hang off existing nodes, so the run still samples
+        # exactly twice -- nothing here creates an extra task or a second
+        # sampling pass, it only names which stage a pixel came from. Without it
+        # a pale band under the chin cannot be attributed to one pass or the
+        # other after the fact.
+        "20": {
+            "class_type": "SaveImage",
+            "inputs": {"images": ["10", 0], "filename_prefix": "p29_elegant_clothing_pass"},
+        },
     }
 
 
@@ -675,6 +719,25 @@ def collect_gate_checks(workflow: dict, object_info: dict | None, prompts: dict,
     if workflow["12"]["inputs"]["image"] != ["10", 0]:
         errors.append("hair pass does not start from the clothing pass's stitched output")
 
+    # The two stage records. A SaveImage per pass is how a failed run can be
+    # attributed to the clothing pass or the hair pass afterwards; both must hang
+    # off existing nodes so the diagnostic adds no sampling.
+    saves = {nid: node for nid, node in workflow.items() if node["class_type"] == "SaveImage"}
+    report["stage_records"] = {
+        "save_nodes": sorted(saves),
+        "clothing_pass": [nid for nid, n in saves.items() if n["inputs"]["images"] == ["10", 0]],
+        "final": [nid for nid, n in saves.items() if n["inputs"]["images"] == ["18", 0]],
+    }
+    if not report["stage_records"]["clothing_pass"]:
+        errors.append("no SaveImage captures the clothing pass before the hair pass runs")
+    if not report["stage_records"]["final"]:
+        errors.append("no SaveImage captures the final hair pass")
+    extra_saves = set(saves) - set(report["stage_records"]["clothing_pass"]) - set(
+        report["stage_records"]["final"]
+    )
+    if extra_saves:
+        errors.append(f"unexpected SaveImage nodes {sorted(extra_saves)}")
+
     ckpt = validate_checkpoint(object_info)
     report["checkpoint_notes"] = ckpt
     errors.extend(n for n in ckpt if n.startswith("ERROR"))
@@ -688,6 +751,14 @@ def collect_gate_checks(workflow: dict, object_info: dict | None, prompts: dict,
         for kind, phrase in (("clothing", "深橄榄绿法式复古衬衫"), ("hair", "栗子棕"))
     )
     report["negative_prompt_terms_ok"] = all(t in prompts["negative"] for t in REQUIRED_NEGATIVE_TERMS)
+    report["collar_clause_ok"] = COLLAR_CLAUSE in prompts["clothing"]
+    report["collar_negative_terms_ok"] = all(
+        term in prompts["negative"] for term in COLLAR_NEGATIVE_TERMS
+    )
+    if not report["collar_clause_ok"]:
+        errors.append("clothing prompt does not pin a closed, higher collar")
+    if not report["collar_negative_terms_ok"]:
+        errors.append("negative prompt does not rule out a deep V neckline")
 
     # 3. files, sizes and coordinates.
     source = json.loads((package / "manifest.json").read_text())["source_image"]
