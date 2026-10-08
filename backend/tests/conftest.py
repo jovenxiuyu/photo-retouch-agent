@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from app.api.dependencies import (
     get_agent_brain_factory,
@@ -61,4 +61,37 @@ def make_image_bytes(image_format: str = "PNG", size: tuple[int, int] = (32, 24)
     buffer = BytesIO()
     image = Image.new("RGB", size, color=(36, 124, 114))
     image.save(buffer, format=image_format)
+    return buffer.getvalue()
+
+
+def make_portrait_bytes(size: tuple[int, int] = (640, 960)) -> bytes:
+    """A synthetic vertical frame whose centre is filled with a skin-tone oval."""
+    image = Image.new("RGB", size, color=(198, 205, 212))
+    draw = ImageDraw.Draw(image)
+    width, height = size
+    draw.ellipse(
+        (width * 0.18, height * 0.10, width * 0.82, height * 0.62),
+        fill=(221, 168, 138),
+    )
+    draw.rectangle(
+        (width * 0.10, height * 0.62, width * 0.90, height * 1.0),
+        fill=(58, 62, 74),
+    )
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def make_landscape_bytes(size: tuple[int, int] = (960, 640)) -> bytes:
+    """A synthetic frame with sky and grass only - no skin-tone subject."""
+    image = Image.new("RGB", size, color=(80, 130, 190))
+    draw = ImageDraw.Draw(image)
+    width, height = size
+    draw.rectangle((0, height * 0.55, width, height), fill=(90, 150, 80))
+    draw.polygon(
+        [(0, height * 0.75), (width * 0.5, height * 0.2), (width, height * 0.75)],
+        fill=(120, 132, 128),
+    )
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
     return buffer.getvalue()

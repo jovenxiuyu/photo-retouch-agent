@@ -34,7 +34,7 @@ export function analyzePhoto(imageId, brain = {}, action = {}) {
   return request("/photos/analyze", {
     method: "POST",
     headers: modelHeaders(brain, action),
-    body: JSON.stringify({ imageId, domainType: "general" }),
+    body: JSON.stringify({ imageId, domainType: "auto" }),
   });
 }
 

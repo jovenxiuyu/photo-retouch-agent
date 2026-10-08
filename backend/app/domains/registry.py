@@ -1,6 +1,10 @@
 from __future__ import annotations
+
+from pathlib import Path
+
 from app.core.errors import bad_request
 from app.domains.base import PhotoAnalyzer, RetouchPlanner
+from app.domains.detector import AUTO_DOMAIN_TYPE, detect_domain_type
 from app.domains.general.analyzer import GeneralAnalyzer
 from app.domains.general.planner import GeneralPlanner
 from app.domains.portrait.analyzer import PortraitAnalyzer
@@ -23,6 +27,11 @@ class DomainRegistry:
             "landscape": general_planner,
             "product": general_planner,
         }
+
+    def resolve_domain_type(self, domain_type: str, image_path: Path) -> str:
+        if domain_type == AUTO_DOMAIN_TYPE:
+            return detect_domain_type(image_path)
+        return domain_type
 
     def get_analyzer(self, domain_type: str) -> PhotoAnalyzer:
         analyzer = self._analyzers.get(domain_type)

@@ -38,7 +38,8 @@ class RegistryAnalysisCatalog(AnalysisCatalog):
         image_path: Path,
         domain_type: str,
     ) -> PhotoAnalysis:
-        analyzer = self._registry.get_analyzer(domain_type)
+        resolved = self._registry.resolve_domain_type(domain_type, image_path)
+        analyzer = self._registry.get_analyzer(resolved)
         return analysis_to_domain(analyzer.analyze(image_id, image_path))
 
 
