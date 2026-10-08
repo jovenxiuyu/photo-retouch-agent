@@ -86,6 +86,7 @@ def test_provider_capabilities_are_safe(client: TestClient) -> None:
         "qwen",
         "glm",
         "doubao",
+        "siliconflow",
         "deepseek",
         "local",
     ]
@@ -93,6 +94,7 @@ def test_provider_capabilities_are_safe(client: TestClient) -> None:
         "qwen",
         "wan",
         "seedream",
+        "siliconflow",
         "mock",
     ]
     assert payload["brainProviders"][0]["visionMode"] == "direct"

@@ -102,11 +102,14 @@ function modelRequest(layer) {
   const isBrain = layer === "brain";
   const providerName = isBrain ? elements.brainProviderSelect.value : elements.actionProviderSelect.value;
   const directApiKey = (isBrain ? elements.brainApiKeyInput.value : elements.actionApiKeyInput.value).trim();
+  const brainProvider = elements.brainProviderSelect.value;
+  const sharedKeyActions = {
+    qwen: ["qwen", "wan"],
+    doubao: ["seedream"],
+    siliconflow: ["siliconflow"],
+  };
   const canReuseBrainKey =
-    !isBrain &&
-    ((elements.brainProviderSelect.value === "qwen" &&
-      ["qwen", "wan"].includes(providerName)) ||
-      (elements.brainProviderSelect.value === "doubao" && providerName === "seedream"));
+    !isBrain && (sharedKeyActions[brainProvider] || []).includes(providerName);
   return {
     name: providerName,
     apiKey: directApiKey || (canReuseBrainKey ? elements.brainApiKeyInput.value.trim() : ""),

@@ -9,6 +9,7 @@ from app.providers.mock_image_provider import MockImageProvider
 from app.providers.qwen_image_provider import QwenImageProvider
 from app.providers.registry import ImageProviderPlugin, ImageProviderRegistry
 from app.providers.seedream_image_provider import SeedreamImageProvider
+from app.providers.siliconflow_image_provider import SiliconFlowImageProvider
 
 _WORKSPACE_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 
@@ -50,6 +51,8 @@ class ImageProviderFactory:
             "wanModel": self.config.dashscope_wan_model,
             "seedreamConfigured": bool(self.config.ark_api_key),
             "seedreamModel": self.config.ark_image_model,
+            "siliconflowConfigured": bool(self.config.siliconflow_api_key),
+            "siliconflowImageModel": self.config.siliconflow_image_model,
             "workspaceConfigured": bool(
                 self.config.dashscope_workspace_id or self.config.dashscope_endpoint
             ),
@@ -99,6 +102,18 @@ class ImageProviderFactory:
                     "Seedream",
                     self.config.ark_image_model,
                     bool(self.config.ark_api_key),
+                ),
+            )
+        )
+        self.register(
+            ImageProviderPlugin(
+                plugin_id="siliconflow",
+                build=self._create_siliconflow_provider,
+                capability=lambda: self._capability(
+                    "siliconflow",
+                    "SiliconFlow Image",
+                    self.config.siliconflow_image_model,
+                    bool(self.config.siliconflow_api_key),
                 ),
             )
         )
@@ -158,6 +173,25 @@ class ImageProviderFactory:
             api_key=resolved_key,
             endpoint=self.config.ark_image_endpoint,
             model_name=self.config.ark_image_model,
+            timeout_seconds=self.config.provider_timeout_seconds,
+            download_limit_bytes=self.config.provider_download_limit_bytes,
+        )
+
+    def _create_siliconflow_provider(
+        self,
+        api_key: str | None,
+        _workspace_id: str | None,
+    ) -> ImageEditProvider:
+        resolved_key = self._require_key(
+            api_key,
+            self.config.siliconflow_api_key,
+            "SiliconFlow",
+            "SILICONFLOW_API_KEY",
+        )
+        return SiliconFlowImageProvider(
+            api_key=resolved_key,
+            base_url=self.config.siliconflow_base_url,
+            model_name=self.config.siliconflow_image_model,
             timeout_seconds=self.config.provider_timeout_seconds,
             download_limit_bytes=self.config.provider_download_limit_bytes,
         )

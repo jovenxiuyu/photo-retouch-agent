@@ -133,6 +133,25 @@ class Settings:
             "ARK_IMAGE_MODEL", "doubao-seedream-5-0-260128"
         ).strip()
     )
+    siliconflow_api_key: str | None = field(
+        default_factory=lambda: _optional_env("SILICONFLOW_API_KEY"),
+        repr=False,
+    )
+    siliconflow_base_url: str = field(
+        default_factory=lambda: (
+            _optional_env("SILICONFLOW_BASE_URL") or "https://api.siliconflow.cn/v1"
+        ).rstrip("/")
+    )
+    siliconflow_vision_model: str = field(
+        default_factory=lambda: os.getenv(
+            "SILICONFLOW_VISION_MODEL", "Qwen/Qwen3.5-35B-A3B"
+        ).strip()
+    )
+    siliconflow_image_model: str = field(
+        default_factory=lambda: os.getenv(
+            "SILICONFLOW_IMAGE_MODEL", "Qwen/Qwen-Image-Edit-2509"
+        ).strip()
+    )
 
     @property
     def uploads_dir(self) -> Path:

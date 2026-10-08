@@ -32,6 +32,7 @@ def temp_settings(tmp_path: Path) -> Settings:
         deepseek_api_key=None,
         zhipu_api_key=None,
         ark_api_key=None,
+        siliconflow_api_key=None,
         rate_limit_per_second=0,
         max_concurrent_jobs=10,
     )
