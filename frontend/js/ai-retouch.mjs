@@ -171,7 +171,11 @@ export function normalizeStylingProposals(proposals) {
   return looks;
 }
 
-export function buildStylingInstruction(proposal, userInstruction = "") {
+export function buildStylingInstruction(proposal) {
+  // The user's supplementary request is deliberately *not* folded in here: it
+  // travels as the job's ``userInstruction`` and is appended exactly once by
+  // the image provider as the final hop. Adding it here as well would send the
+  // same sentence to the model twice.
   const parts = [
     `按「${proposal.name || proposal.title}」造型方案改造本人照片。`,
     (proposal.editPrompt || "").trim(),
@@ -179,32 +183,47 @@ export function buildStylingInstruction(proposal, userInstruction = "") {
   if (proposal.identityAnchors?.length) {
     parts.push(`保留本人辨识特征（尽力而为，不保证百分之百）：${proposal.identityAnchors.join("、")}。`);
   }
-  const extra = (userInstruction || "").trim();
-  if (extra) parts.push(`用户补充要求：${extra}`);
   return parts.filter(Boolean).join("\n");
 }
 
-export function estimateStylingCost(proposals, { selectedCount = 1 } = {}) {
+export function estimateStylingCost(
+  proposals,
+  { selectedCount = 1, mode = "template" } = {},
+) {
   const looks = Array.isArray(proposals) ? proposals : [];
+  const isAi = mode === "ai";
   const perLook = Math.max(1, Number(looks[0]?.estimatedPaidRequests) || 1);
   const count = Math.max(1, Math.min(Number(selectedCount) || 1, looks.length || 1));
+  const designRequests = isAi ? 1 : 0;
+  const designNote = isAi
+    ? "AI 个性化设计：点击后一次性生成三套方案，预计 1 次模型调用（1 次付费请求）。"
+    : "免费模板预览：0 次模型调用，免费生成，不产生任何费用。";
   return {
+    designMode: isAi ? "ai" : "template",
+    designRequests,
     selectedCount: count,
     requestsPerLook: perLook,
     totalRequests: perLook * count,
-    note: `造型方案免费生成（0 次付费请求）；出图只对选中的 ${count} 套各发起 ${perLook} 次图像编辑请求，合计约 ${perLook * count} 次。`,
+    note: `${designNote}出图只对选中的 ${count} 套各发起 ${perLook} 次图像编辑请求，合计约 ${perLook * count} 次。`,
   };
 }
 
-export async function designStyling({ file, brain, action, api }) {
+export async function designStyling({
+  file,
+  brain,
+  action,
+  mode = "template",
+  userInstruction = "",
+  api,
+}) {
   if (!file) throw new Error("请先选择一张照片。");
 
   const photo = await api.uploadPhoto(file);
   const analysis = await api.analyzePhoto(photo.imageId, brain, action);
   const proposals = normalizeStylingProposals(
-    await api.createStylingProposals(analysis),
+    await api.createStylingProposals(analysis, { mode, brain, userInstruction }),
   );
-  return { photo, analysis, proposals };
+  return { photo, analysis, proposals, mode };
 }
 
 async function resolveStylingJob(api, created) {
@@ -251,7 +270,7 @@ export async function executeStyling({
   if (!proposal) throw new Error("请选择一套要生成的造型。");
   if (!photo?.imageId) throw new Error("缺少原图，请重新上传照片后再生成。");
 
-  const instruction = buildStylingInstruction(proposal, userInstruction);
+  const instruction = buildStylingInstruction(proposal);
   const plan = {
     ...proposal,
     editPrompt: instruction,

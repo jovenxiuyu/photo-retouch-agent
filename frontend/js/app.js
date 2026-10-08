@@ -76,6 +76,7 @@ const elements = {
   documentName: document.querySelector("#documentName"),
   stylingSource: document.querySelector("#stylingSource"),
   stylingDesignButton: document.querySelector("#stylingDesignButton"),
+  stylingTemplateButton: document.querySelector("#stylingTemplateButton"),
   stylingCostNote: document.querySelector("#stylingCostNote"),
   stylingGrid: document.querySelector("#stylingGrid"),
   stylingRefine: document.querySelector("#stylingRefine"),
@@ -422,11 +423,26 @@ function selectStylingProposal(planId) {
 function updateStylingCostNote() {
   const looks = currentStylingProposals();
   if (!looks.length) return;
-  const cost = estimateStylingCost(looks, { selectedCount: 1 });
+  const mode = stylingDesignMode();
+  const cost = estimateStylingCost(looks, { selectedCount: 1, mode });
   const selected = selectedStylingProposal();
   elements.stylingCostNote.textContent = selected
     ? `已选「${selected.name || selected.planId}」：${cost.note} 未点击生成前不会产生任何请求。`
     : cost.note;
+}
+
+
+function stylingDesignMode() {
+  return currentStylingProposals()[0]?.designMode === "ai" ? "ai" : "template";
+}
+
+
+function designSourceLabel(proposal) {
+  const isAi = proposal.designMode === "ai";
+  const provider = proposal.sourceProvider ? ` · ${proposal.sourceProvider}` : "";
+  return isAi
+    ? { text: `AI 个性化设计${provider}`, className: "styling-source-badge ai" }
+    : { text: "免费模板预览", className: "styling-source-badge template" };
 }
 
 
@@ -444,16 +460,18 @@ function renderStylingCards(proposals) {
     .map((look) => {
       const active = look.planId === state.selectedStylingId;
       const presets = Array.isArray(look.referencePresets) ? look.referencePresets : [];
+      const source = designSourceLabel(look);
       const presetChips = presets
         .slice(0, 6)
         .map((preset) => `<span class="styling-chip">${escapeHtml(preset.nameZh || preset.name || preset.presetId)}</span>`)
         .join("");
       return `
-        <article class="styling-card ${active ? "active" : ""}" data-styling-card="${escapeHtml(look.planId)}">
+        <article class="styling-card ${active ? "active" : ""}" data-styling-card="${escapeHtml(look.planId)}" data-design-mode="${escapeHtml(look.designMode || "template")}">
           <header class="styling-card-head">
             <strong>${escapeHtml(look.name || look.title)}</strong>
             <em>${escapeHtml(referenceSourceLabel(look) || "stylekit")}</em>
           </header>
+          <span class="${source.className}">${escapeHtml(source.text)}</span>
           <span class="styling-card-direction">${escapeHtml(look.designDirection || look.designAxis || "")}</span>
           <dl>
             <dt>发型</dt><dd>${escapeHtml(look.hairPlan)}</dd>
@@ -482,11 +500,22 @@ function renderStylingCards(proposals) {
 }
 
 
-async function designStylingFlow() {
+function setStylingBusy(busy) {
+  state.stylingBusy = busy;
+  elements.stylingDesignButton.disabled = busy;
+  if (elements.stylingTemplateButton) elements.stylingTemplateButton.disabled = busy;
+  if (elements.stylingRefineButton) elements.stylingRefineButton.disabled = busy;
+}
+
+
+async function designStylingFlow(mode = "template") {
   if (state.stylingBusy) return;
-  state.stylingBusy = true;
-  elements.stylingDesignButton.disabled = true;
-  elements.stylingFeedback.textContent = "正在分析人物特征并设计三套造型（设计方案免费，0 次付费请求）。";
+  const isAi = mode === "ai";
+  const userInstruction = (elements.stylingInstruction?.value || "").trim();
+  setStylingBusy(true);
+  elements.stylingFeedback.textContent = isAi
+    ? "正在调用 AI 分析人物视觉特征并个性化设计三套造型（预计 1 次模型调用）。"
+    : "正在使用免费模板组合生成三套造型预览（0 次模型调用，不产生任何费用）。";
   elements.stylingFeedback.className = "ai-feedback";
 
   try {
@@ -494,7 +523,7 @@ async function designStylingFlow() {
     const action = modelRequest("action");
     validateModelSelection(state.capabilities, brain, action);
     const file = await currentSourceFile();
-    const result = await designStyling({ file, brain, action, api: aiApi });
+    const result = await designStyling({ file, brain, action, mode, userInstruction, api: aiApi });
     state.stylingPhoto = result.photo;
     state.stylingAnalysis = result.analysis;
     state.stylingProposals = result.proposals;
@@ -504,14 +533,19 @@ async function designStylingFlow() {
     elements.stylingRefine.hidden = true;
     renderStylingCards(result.proposals);
     selectStylingProposal(state.selectedStylingId);
-    elements.stylingFeedback.textContent = `已生成 ${result.proposals.length} 套造型设计，选择一套再生成图片。`;
+    elements.stylingFeedback.textContent = isAi
+      ? `AI 个性化设计完成 ${result.proposals.length} 套造型（1 次模型调用），选择一套再生成图片。`
+      : `已生成 ${result.proposals.length} 套免费模板预览（0 次模型调用），选择一套再生成图片。`;
     elements.stylingFeedback.className = "ai-feedback success";
   } catch (error) {
-    elements.stylingFeedback.textContent = error.message;
+    // A failed AI design must surface as an error — never silently fall back to
+    // the local templates while pretending the AI produced the result.
+    elements.stylingFeedback.textContent = isAi
+      ? `AI 个性化设计失败：${error.message}（未生成或使用任何模板方案，可改用「免费模板预览」。）`
+      : error.message;
     elements.stylingFeedback.className = "ai-feedback error";
   } finally {
-    state.stylingBusy = false;
-    elements.stylingDesignButton.disabled = false;
+    setStylingBusy(false);
   }
 }
 
@@ -526,10 +560,12 @@ async function generateStyling(planId) {
     return;
   }
 
-  const cost = estimateStylingCost(currentStylingProposals(), { selectedCount: 1 });
+  const cost = estimateStylingCost(currentStylingProposals(), {
+    selectedCount: 1,
+    mode: stylingDesignMode(),
+  });
   const userInstruction = (elements.stylingInstruction?.value || "").trim();
-  state.stylingBusy = true;
-  elements.stylingDesignButton.disabled = true;
+  setStylingBusy(true);
   elements.stylingFeedback.textContent = `即将生成「${proposal.name || planId}」：预计 ${cost.totalRequests} 次付费图像编辑请求（￥按服务商计费）。`;
   elements.stylingFeedback.className = "ai-feedback";
   elements.footerStatus.textContent = "AI 造型生成中";
@@ -561,8 +597,7 @@ async function generateStyling(planId) {
     elements.stylingFeedback.textContent = error.message;
     elements.stylingFeedback.className = "ai-feedback error";
   } finally {
-    state.stylingBusy = false;
-    elements.stylingDesignButton.disabled = false;
+    setStylingBusy(false);
   }
 }
 
@@ -581,8 +616,7 @@ async function refineStylingFlow() {
     return;
   }
 
-  state.stylingBusy = true;
-  elements.stylingRefineButton.disabled = true;
+  setStylingBusy(true);
   elements.stylingFeedback.textContent = "即将基于上一版结果发起 1 次付费图像编辑请求。";
   elements.stylingFeedback.className = "ai-feedback";
 
@@ -610,8 +644,7 @@ async function refineStylingFlow() {
     elements.stylingFeedback.textContent = error.message;
     elements.stylingFeedback.className = "ai-feedback error";
   } finally {
-    state.stylingBusy = false;
-    elements.stylingRefineButton.disabled = false;
+    setStylingBusy(false);
   }
 }
 
@@ -625,9 +658,14 @@ async function loadStylingVocabulary() {
     elements.stylingSource.textContent = vocab.available
       ? `风格库已加载 · ${vocab.sourceLabel || "stylekit"} · ${files} 个文件`
       : "风格库不可用，将使用内置兜底词汇";
-    const cost = estimateStylingCost([{ estimatedPaidRequests: info.estimatedRequestsPerGeneration || 1 }], { selectedCount: 1 });
+    const cost = estimateStylingCost(
+      [{ estimatedPaidRequests: info.estimatedRequestsPerGeneration || 1 }],
+      { selectedCount: 1, mode: "ai" },
+    );
     if (elements.stylingCostNote) {
-      elements.stylingCostNote.textContent = `方案设计免费（0 次付费请求）；出图只对选中的一套发起 ${cost.requestsPerLook} 次图像编辑请求。`;
+      const aiRequests = Number(info.stylingAiDesignRequests ?? cost.designRequests) || 1;
+      elements.stylingCostNote.textContent =
+        `AI 个性化设计：1 次模型调用（约 ${aiRequests} 次付费请求，一次性生成三套方案）；免费模板预览 0 次调用。出图只对选中的一套发起 ${cost.requestsPerLook} 次图像编辑请求。`;
     }
   } catch (error) {
     elements.stylingSource.textContent = "风格库状态读取失败";
@@ -727,7 +765,10 @@ function init() {
   state.stylingBusy = false;
   state.stylingPhoto = state.stylingPhoto || null;
   state.generatedStylingJobId = state.generatedStylingJobId ?? null;
-  elements.stylingDesignButton.addEventListener("click", designStylingFlow);
+  elements.stylingDesignButton.addEventListener("click", () => designStylingFlow("ai"));
+  if (elements.stylingTemplateButton) {
+    elements.stylingTemplateButton.addEventListener("click", () => designStylingFlow("template"));
+  }
   elements.stylingRefineButton.addEventListener("click", refineStylingFlow);
 
   elements.generateButton.addEventListener("click", async () => {

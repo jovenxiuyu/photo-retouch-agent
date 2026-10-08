@@ -42,6 +42,13 @@ class StylingProposal:
     negative_prompt: str = ""
     reference_presets: tuple[StylingReference, ...] = ()
     estimated_paid_requests: int = 1
+    # Where the design came from. ``template`` is the free, deterministic
+    # ``_Axis`` composition; ``ai`` is a real model-authored design. Keeping the
+    # provenance on the proposal (instead of only in the UI) means a template
+    # fallback can never be presented as a personalised AI design.
+    design_mode: str = "template"
+    source_provider: str = ""
+    selected_presets: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.plan_id:
@@ -50,3 +57,5 @@ class StylingProposal:
             raise ValueError("domain_type is required")
         if not self.design_axis:
             raise ValueError("design_axis is required")
+        if self.design_mode not in {"template", "ai"}:
+            raise ValueError("design_mode must be template or ai")

@@ -51,9 +51,23 @@ class StylingProposal(BaseModel):
         default_factory=list, alias="referencePresets"
     )
     estimated_paid_requests: int = Field(default=1, alias="estimatedPaidRequests")
+    # Provenance: ``template`` is the free deterministic composition, ``ai`` is a
+    # design authored by a real model. Surfaced so the UI can never present a
+    # template fallback as a personalised AI design.
+    design_mode: str = Field(default="template", alias="designMode")
+    source_provider: str = Field(default="", alias="sourceProvider")
+    selected_presets: list[str] = Field(
+        default_factory=list, alias="selectedPresets"
+    )
 
 
 class StylingProposalsRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     analysis: PhotoAnalysis
+    # ``template`` keeps the free, zero-cost behaviour. ``ai`` asks the styling
+    # planner to author three looks with a real vision model (one paid request).
+    mode: str = "template"
+    # Optional free-text wishes the person typed before designing (e.g. "想剪短").
+    # Passed to the planner once; it never triggers an extra request.
+    user_instruction: str = Field(default="", alias="userInstruction")

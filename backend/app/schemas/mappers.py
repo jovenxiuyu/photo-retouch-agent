@@ -181,6 +181,9 @@ def styling_proposal_to_domain(
             for reference in proposal.reference_presets
         ),
         estimated_paid_requests=proposal.estimated_paid_requests,
+        design_mode=proposal.design_mode,
+        source_provider=proposal.source_provider,
+        selected_presets=list(proposal.selected_presets),
     )
 
 
@@ -219,6 +222,9 @@ def styling_proposal_to_schema(
             for reference in proposal.reference_presets
         ],
         estimated_paid_requests=proposal.estimated_paid_requests,
+        design_mode=proposal.design_mode,
+        source_provider=proposal.source_provider,
+        selected_presets=list(proposal.selected_presets),
     )
 
 

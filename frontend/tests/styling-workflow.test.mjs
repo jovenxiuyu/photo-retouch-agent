@@ -60,12 +60,15 @@ test("normalizeStylingProposals requires three distinct prompts", () => {
   );
 });
 
-test("buildStylingInstruction merges the look, anchors and user text", () => {
+test("buildStylingInstruction merges the look and anchors without duplicating user text", () => {
+  // The supplementary request travels as the job ``userInstruction`` and is
+  // appended exactly once by the image provider; it must not be folded in here.
   const instruction = buildStylingInstruction(THREE_LOOKS[0], "头发再短一点");
   assert.match(instruction, /urban_short/);
   assert.match(instruction, /保留本人辨识特征/);
   assert.match(instruction, /保留圆润脸型轮廓/);
-  assert.match(instruction, /用户补充要求：头发再短一点/);
+  assert.doesNotMatch(instruction, /用户补充要求/);
+  assert.doesNotMatch(instruction, /头发再短一点/);
   assert.match(instruction, /不保证百分之百/);
 });
 
@@ -77,6 +80,59 @@ test("estimateStylingCost reports requests and the free design phase", () => {
 
   const two = estimateStylingCost(THREE_LOOKS, { selectedCount: 2 });
   assert.equal(two.totalRequests, 2);
+});
+
+test("estimateStylingCost separates free template preview from the one-call AI design", () => {
+  const template = estimateStylingCost(THREE_LOOKS, { selectedCount: 1, mode: "template" });
+  assert.equal(template.designMode, "template");
+  assert.equal(template.designRequests, 0);
+  assert.match(template.note, /免费生成/);
+
+  const ai = estimateStylingCost(THREE_LOOKS, { selectedCount: 1, mode: "ai" });
+  assert.equal(ai.designMode, "ai");
+  assert.equal(ai.designRequests, 1);
+  assert.match(ai.note, /1 次模型调用/);
+  assert.equal(ai.totalRequests, 1);
+});
+
+test("designStyling forwards the design mode and user text, and never mislabels templates as AI", async () => {
+  const calls = [];
+  const api = {
+    async uploadPhoto() {
+      return { imageId: "img_1" };
+    },
+    async analyzePhoto() {
+      return { imageId: "img_1", domainType: "portrait" };
+    },
+    async createStylingProposals(analysis, options) {
+      calls.push(options);
+      return THREE_LOOKS.map((look) => ({ ...look, designMode: options.mode }));
+    },
+  };
+
+  const aiResult = await designStyling({
+    file: { name: "portrait.png" },
+    brain: { name: "siliconflow", apiKey: "sk-x" },
+    action: { name: "siliconflow" },
+    mode: "ai",
+    userInstruction: "想要更干练",
+    api,
+  });
+  assert.equal(aiResult.mode, "ai");
+  assert.equal(calls[0].mode, "ai");
+  assert.equal(calls[0].userInstruction, "想要更干练");
+  assert.equal(calls[0].brain.name, "siliconflow");
+  assert.ok(aiResult.proposals.every((look) => look.designMode === "ai"));
+
+  const templateResult = await designStyling({
+    file: { name: "portrait.png" },
+    brain: {},
+    action: {},
+    api,
+  });
+  assert.equal(templateResult.mode, "template");
+  assert.equal(calls[1].mode, "template");
+  assert.ok(templateResult.proposals.every((look) => look.designMode !== "ai"));
 });
 
 test("designs three looks, then generates only the selected look from the original", async () => {
@@ -180,9 +236,12 @@ test("designs three looks, then generates only the selected look from the origin
     api,
   });
   assert.equal(withExtra.proposal.planId, "artistic_wave");
-  assert.match(submittedPrompt, /用户补充要求：头发再短一点/);
+  // The look prompt never repeats the user's own words...
+  assert.doesNotMatch(submittedPrompt, /用户补充要求/);
+  assert.doesNotMatch(submittedPrompt, /头发再短一点/);
   assert.match(submittedPrompt, /artistic_wave/);
   assert.doesNotMatch(submittedPrompt, /bold_street/);
+  // ...they ride along exactly once as the job's userInstruction.
   assert.equal(submittedInstruction, "头发再短一点");
 });
 

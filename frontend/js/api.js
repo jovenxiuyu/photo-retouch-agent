@@ -46,11 +46,14 @@ export function createPlans(analysis) {
   });
 }
 
-export function createStylingProposals(analysis) {
+export function createStylingProposals(
+  analysis,
+  { mode = "template", brain = {}, userInstruction = "" } = {},
+) {
   return request("/styling/proposals", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ analysis }),
+    headers: modelHeaders(brain, {}),
+    body: JSON.stringify({ analysis, mode, userInstruction }),
   });
 }
 

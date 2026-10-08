@@ -41,6 +41,24 @@ class OpenAICompatiblePromptBrain:
         self.timeout_seconds = timeout_seconds
         self._transport = transport
 
+    def provider_config(self) -> dict[str, Any]:
+        """Everything needed to build another brain for the same provider.
+
+        Used to hand the same credentials/endpoint to a more specialised brain
+        (e.g. the styling planner). The API key is returned only so the sibling
+        object can authenticate; callers must never log or serialise it.
+        """
+        return {
+            "provider_name": self.provider_name,
+            "api_key": self._api_key,
+            "endpoint": self.endpoint,
+            "model_name": self.model_name,
+            "vision_mode": self.vision_mode,
+            "image_url_mode": self.image_url_mode,
+            "timeout_seconds": self.timeout_seconds,
+            "transport": self._transport,
+        }
+
     async def analyze(
         self,
         image_id: str,
@@ -184,6 +202,7 @@ class OpenAICompatiblePromptBrain:
         system_prompt: str,
         user_text: str,
         image_path: Path | None,
+        temperature: float = 0.2,
     ) -> str:
         user_content: str | list[dict[str, Any]] = user_text
         if image_path is not None:
@@ -201,7 +220,7 @@ class OpenAICompatiblePromptBrain:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
             ],
-            "temperature": 0.2,
+            "temperature": temperature,
             "stream": False,
         }
 
