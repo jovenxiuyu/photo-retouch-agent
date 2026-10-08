@@ -47,3 +47,9 @@ evidence/p29-runninghub-live/*.py
 # worker stays local-only. The findings it supports are written up in
 # evidence/p29-runninghub-audit.md and evidence/p29-runninghub-live-audit.md.
 evidence/p29-live-run/*.json
+
+# P2.9 fix-run forensics: probe scripts, upstream source dumps and comparison
+# renders all embed the subject's photo (or GPL upstream code). Findings are
+# written up in evidence/p29-fix-run-report.md; keep only the derived stats.
+evidence/p29-fix-run/*
+!evidence/p29-fix-run/accept_stats.json
