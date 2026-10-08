@@ -200,6 +200,17 @@ class Settings:
             os.getenv("PHOTO_AGENT_ANALYSIS_CACHE_MAX", "64")
         )
     )
+    # --- semantic human parsing (ATR) ------------------------------------
+    # The P2.6 edit masks were pure geometry: an ellipse for the hair and a
+    # rectangle for the clothing. This pins the ONNX export of the pretrained
+    # SCHP ATR human parser that replaces those stand-ins with real semantic
+    # regions. It is read-only inference on the CPU; no training, no paid call.
+    human_parsing_model_path: Path = field(
+        default_factory=lambda: Path(
+            os.getenv("PHOTO_AGENT_HUMAN_PARSING_MODEL")
+            or str(PROJECT_ROOT / "data" / "models" / "schp-atr-18.onnx")
+        )
+    )
 
     @property
     def uploads_dir(self) -> Path:
