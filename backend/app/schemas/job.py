@@ -42,6 +42,7 @@ class RetouchJob(BaseModel):
     output_image_ids: list[str] = Field(default_factory=list, alias="outputImageIds")
     output_urls: list[str] = Field(default_factory=list, alias="outputUrls")
     face_lock: dict | None = Field(default=None, alias="faceLock")
+    native_mask: dict | None = Field(default=None, alias="nativeMask")
     error_message: str | None = Field(default=None, alias="errorMessage")
     created_at: datetime = Field(alias="createdAt")
     updated_at: datetime = Field(alias="updatedAt")

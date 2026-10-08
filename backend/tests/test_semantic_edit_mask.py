@@ -57,6 +57,15 @@ FACE_COLS = (120, 240)
 CLOTHING_ROWS = (300, 470)
 CLOTHING_COLS = (70, 290)
 
+#: A high collar rises to the jaw and ATR has no collar class for it, so the
+#: parser files it as Face. Here the band below the chin is added to the Face
+#: island: a cool garment white (not this subject's skin tone) on the outside
+#: and a skin-toned throat strip down the middle.
+COLLAR_ROWS = (280, 330)
+COLLAR_COLS = (120, 240)
+NECK_COLS = (170, 200)
+COLLAR_COLOUR = np.array([232, 238, 248], dtype=np.uint8)
+
 
 def _ring(points: np.ndarray, indices, center, rx: float, ry: float) -> None:
     count = len(indices)
@@ -297,3 +306,85 @@ def test_legacy_config_is_still_available():
     """P2.6 compatibility: the geometric knobs still exist and build a set."""
     legacy = build_edit_masks(_image(), _landmarks(), config=EditMaskConfig())
     assert legacy.stats["hairPixels"] > 0
+
+
+# ---------------------------------------------------------------- collar split
+
+
+def _collar_image() -> np.ndarray:
+    """A white collar the parser mislabels as Face, with a real throat strip."""
+    image = _image().copy()
+    image[
+        COLLAR_ROWS[0] : COLLAR_ROWS[1], COLLAR_COLS[0] : COLLAR_COLS[1]
+    ] = COLLAR_COLOUR
+    image[COLLAR_ROWS[0] : COLLAR_ROWS[1], NECK_COLS[0] : NECK_COLS[1]] = SKIN
+    return image
+
+
+def _collar_labels() -> np.ndarray:
+    labels = _labels().copy()
+    labels[
+        COLLAR_ROWS[0] : COLLAR_ROWS[1], COLLAR_COLS[0] : COLLAR_COLS[1]
+    ] = FACE
+    return labels
+
+
+def test_white_collar_below_the_chin_becomes_editable_clothing():
+    """The old collar must be repaintable, and the throat beside it must not."""
+    result = build_semantic_edit_masks(_collar_image(), _landmarks(), _collar_labels())
+
+    assert result.stats["collarSplitEnabled"] is True
+    assert result.stats["collarSplitApplied"] is True
+    assert result.stats["collarReclassifiedPixels"] > 0
+    # Everything carved out of the face island lands in the edit area.
+    assert result.stats["collarEditablePixels"] == result.stats["collarReclassifiedPixels"]
+    # The skin-toned throat inside the same band stays protected.
+    assert result.stats["neckSkinProtectedPixels"] > 0
+    assert result.stats["identityCoversEditable"] is True
+    assert result.stats["protectedCoversEditable"] is True
+    assert 0.0 <= result.stats["backgroundEditableShare"] < 0.35
+
+    # A collar pixel (left of the throat) is white in the edit mask...
+    collar_row = COLLAR_ROWS[0] + 5
+    collar_col = COLLAR_COLS[0] + 10
+    assert result.editable[collar_row, collar_col] == 255
+    assert result.protected[collar_row, collar_col] == 0
+    # ...while the throat strip in the very same band is kept pixel-for-pixel.
+    neck_col = (NECK_COLS[0] + NECK_COLS[1]) // 2
+    assert result.editable[collar_row + 5, neck_col] == 0
+    assert result.protected[collar_row + 5, neck_col] == 255
+
+    # The separation is tone-based, and the builder says so instead of claiming
+    # a garment-class certainty it does not have.
+    assert "collar_split_is_tone_based" in " ".join(result.gaps)
+
+
+def test_collar_that_cannot_be_told_from_the_throat_stays_protected():
+    """No silent pass: an unseparated collar is protected whole and flagged."""
+    config = SemanticMaskConfig(collar_min_pixels=10 ** 9)
+    result = build_semantic_edit_masks(
+        _collar_image(), _landmarks(), _collar_labels(), config=config
+    )
+
+    assert result.stats["collarSplitApplied"] is False
+    assert result.stats["collarReclassifiedPixels"] == 0
+    assert "collar_split_found_nothing" in " ".join(result.gaps)
+    # The disputed pixels stay on the keep side rather than being guessed at.
+    collar_row = COLLAR_ROWS[0] + 5
+    collar_col = COLLAR_COLS[0] + 10
+    assert result.editable[collar_row, collar_col] == 0
+    assert result.protected[collar_row, collar_col] == 255
+
+
+def test_collar_split_reports_when_no_skin_tone_can_be_sampled():
+    """No sample of the subject's skin -> no split, and an explicit gap."""
+    tiny = np.array([FACE_CX, FACE_CY])
+    landmarks = tiny + (_landmarks() - tiny) * 0.05
+    result = build_semantic_edit_masks(_collar_image(), landmarks, _collar_labels())
+
+    assert result.stats["collarSplitApplied"] is False
+    assert "collar_split_unresolved" in " ".join(result.gaps)
+    collar_row = COLLAR_ROWS[0] + 5
+    collar_col = COLLAR_COLS[0] + 10
+    assert result.editable[collar_row, collar_col] == 0
+    assert result.protected[collar_row, collar_col] == 255

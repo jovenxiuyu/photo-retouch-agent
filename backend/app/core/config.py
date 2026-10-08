@@ -211,6 +211,36 @@ class Settings:
             or str(PROJECT_ROOT / "data" / "models" / "schp-atr-18.onnx")
         )
     )
+    # --- native mask inpainting (fal.ai Qwen Image Edit) ------------------
+    # The styling providers repaint the whole person, so even a good prompt
+    # cannot protect the original collar/eyes. ``fal-ai/qwen-image-edit/inpaint``
+    # takes an explicit black/white mask: black pixels are *kept* and white
+    # pixels are *edited*. It is a separate, opt-in backend and never falls
+    # back to the whole-image path. Wiring the endpoint is free; the model is
+    # only billed when a real generation is dispatched.
+    fal_key: str | None = field(
+        default_factory=lambda: _optional_env("FAL_KEY"),
+        repr=False,
+    )
+    fal_inpaint_endpoint: str = field(
+        default_factory=lambda: (
+            _optional_env("FAL_INPAINT_ENDPOINT")
+            or "https://queue.fal.run/fal-ai/qwen-image-edit/inpaint"
+        ).rstrip("/")
+    )
+    fal_inpaint_model: str = field(
+        default_factory=lambda: os.getenv(
+            "FAL_INPAINT_MODEL", "fal-ai/qwen-image-edit/inpaint"
+        ).strip()
+    )
+    fal_inpaint_poll_interval_seconds: float = field(
+        default_factory=lambda: float(
+            os.getenv("FAL_INPAINT_POLL_INTERVAL", "2.0")
+        )
+    )
+    fal_inpaint_max_poll_seconds: float = field(
+        default_factory=lambda: float(os.getenv("FAL_INPAINT_MAX_POLL", "600"))
+    )
 
     @property
     def uploads_dir(self) -> Path:

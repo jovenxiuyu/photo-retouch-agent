@@ -41,10 +41,15 @@ from app.domains.portrait.edit_mask import (  # noqa: E402
     build_semantic_edit_masks,
 )
 from app.domains.portrait.face_lock import (  # noqa: E402
+    CHIN,
     FEATURE_GROUPS,
     LIPS_INNER,
+    FaceLockConfig,
     MediaPipeLandmarkDetector,
+    adaptive_skin_mask,
     dilate_mask,
+    face_width,
+    skin_reference_colour,
 )
 from app.domains.portrait.human_parsing import ATR_CLASSES  # noqa: E402
 
@@ -223,7 +228,50 @@ def _acceptance(image_rgb, labels, landmarks, mask_set) -> dict:
         for index in GLASSES_BAND
     ]
 
-    clothing_on_face = int((cv2.bitwise_and(clothing, parsed_face) > 0).sum())
+    # The *face* is the anatomy, not everything the parser filed as Face: a
+    # white high collar below the chin arrives as class 11 and is deliberately
+    # editable, so the garment check is scored above the chin row only. The row
+    # is the one the mask builder uses -- the chin landmark plus its margin --
+    # because the few rows just under the landmark are still jaw, and the mask
+    # keeps them by design.
+    face_w = face_width(landmarks)
+    chin_row = int(
+        round(
+            float(landmarks[CHIN][1])
+            + SemanticMaskConfig().collar_margin_ratio * face_w
+        )
+    )
+    above_chin = np.zeros(labels.shape, np.uint8)
+    above_chin[:chin_row, :] = 255
+    face_above_chin = cv2.bitwise_and(parsed_face, above_chin)
+    clothing_on_face = int((cv2.bitwise_and(clothing, face_above_chin) > 0).sum())
+
+    # The old-collar gate. Recomputed from the photo and the landmarks, never
+    # read back from ``stats``: the pixels the parser filed as Face below the
+    # chin that are *not* the subject's own skin are the garment that used to be
+    # frozen with the face. They must now be inside the edit area, and the
+    # throat (below-chin skin) must still be kept.
+    reference, _ = skin_reference_colour(image_rgb, landmarks, face_w)
+    below_chin_face = cv2.bitwise_and(parsed_face, cv2.bitwise_not(above_chin))
+    below_chin_pixels = int((below_chin_face > 0).sum())
+    collar_pixels = 0
+    collar_editable = 0
+    neck_skin_protected = 0
+    collar_colour: list[float] = []
+    collar_separable = reference is not None
+    if collar_separable and below_chin_pixels > 0:
+        skin = adaptive_skin_mask(image_rgb, reference, face_w, FaceLockConfig())
+        collar = cv2.bitwise_and(below_chin_face, cv2.bitwise_not(skin))
+        neck = cv2.bitwise_and(below_chin_face, skin)
+        collar_pixels = int((collar > 0).sum())
+        collar_editable = int((cv2.bitwise_and(collar, editable) > 0).sum())
+        neck_skin_protected = int((cv2.bitwise_and(neck, protected) > 0).sum())
+        if collar_pixels:
+            collar_colour = [
+                round(float(value), 1)
+                for value in image_rgb[collar > 0].mean(axis=0)
+            ]
+
     distinct = len(np.unique(labels))
 
     checks = {
@@ -236,6 +284,10 @@ def _acceptance(image_rgb, labels, landmarks, mask_set) -> dict:
         "faceFeaturesAreInsideProtected": bool(all(feature_hits)),
         "glassesBandIsInsideProtected": bool(all(glasses_hits)),
         "clothingDoesNotCoverTheFace": bool(clothing_on_face == 0),
+        "staleCollarEntersEditArea": bool(
+            below_chin_pixels == 0
+            or (collar_separable and collar_editable >= collar_pixels)
+        ),
         "newHairstyleMayExceedOldHair": bool(int((rim > 0).sum()) > 0),
         "labelMapIsRealSegmentation": bool(distinct >= 4 and stats["hairPixels"] > 0),
     }
@@ -252,6 +304,14 @@ def _acceptance(image_rgb, labels, landmarks, mask_set) -> dict:
             "parsedFaceIslandPixels": stats["parsedFaceIslandPixels"],
             "faceSkinShare": stats["faceSkinShare"],
             "clothingPixelsOnParsedFace": clothing_on_face,
+            "parsedFaceBelowChinPixels": below_chin_pixels,
+            "collarPixelsBelowTheChin": collar_pixels,
+            "collarPixelsInsideEditArea": collar_editable,
+            "neckSkinPixelsStillProtected": neck_skin_protected,
+            "collarSeparableFromNeck": bool(collar_separable),
+            "collarMeanColourRgb": collar_colour,
+            "collarSplitApplied": bool(stats.get("collarSplitApplied", False)),
+            "faceCorePixels": int(stats.get("faceCorePixels", 0)),
             "newSilhouetteRimPixels": int((rim > 0).sum()),
             "featureLandmarkCount": len(feature_hits),
             "glassesLandmarkCount": len(glasses_hits),

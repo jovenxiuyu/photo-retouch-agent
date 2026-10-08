@@ -7,10 +7,12 @@ from app.brains.local import LocalPromptBrain
 from app.core.config import Settings, settings as default_settings
 from app.core.errors import bad_request, not_found
 from app.domains.portrait import face_lock as face_lock_domain
+from app.domains.portrait.inpaint_verify import InpaintVerification
 from app.providers.base import ImageEditProvider
 from app.providers.mock_image_provider import MockImageProvider
 from app.schemas.job import CreateRetouchJobRequest, RefineRetouchJobRequest, RetouchJob
 from app.services.job_store import JobStore
+from app.services.native_mask_inpainting import NativeMaskInpainting
 from app.services.storage import StorageService
 
 
@@ -22,12 +24,14 @@ class RetouchService:
         provider: ImageEditProvider | None = None,
         brain: PromptBrain | None = None,
         settings: Settings | None = None,
+        native_mask: NativeMaskInpainting | None = None,
     ) -> None:
         self.storage = storage
         self.jobs = jobs
         self.provider = provider or MockImageProvider()
         self.brain = brain or LocalPromptBrain()
         self.settings = settings or default_settings
+        self.native_mask = native_mask or NativeMaskInpainting(self.settings)
 
     # ------------------------------------------------------------- face lock
     def _run_face_lock(
@@ -108,6 +112,105 @@ class RetouchService:
         job.updated_at = datetime.now(timezone.utc)
         return job
 
+    # ------------------------------------------------------ native mask flow
+    def _is_native_mask_provider(self) -> bool:
+        """True when the active backend cannot run without a black/white mask.
+
+        The SiliconFlow and mock backends edit the whole image and never see a
+        mask; the fal.ai inpainting backend declares ``requires_edit_mask`` and
+        then *requires* one. There is no fallback between the two: a masked run
+        whose mask cannot be built fails instead of silently degrading to a
+        whole-image edit that would repaint the face.
+        """
+        return bool(getattr(self.provider, "requires_edit_mask", False))
+
+    async def _render(self, job: RetouchJob, source_path, plan) -> None:
+        """Run the single provider call for this job and record the outcome."""
+        output_image_id = f"out_{uuid4().hex[:12]}"
+        output_filename = f"{output_image_id}{self.provider.output_extension}"
+        output_path = self.storage.config.outputs_dir / output_filename
+        if self._is_native_mask_provider():
+            await self._render_native_mask(
+                job,
+                source_path,
+                plan,
+                output_image_id,
+                output_filename,
+                output_path,
+            )
+        else:
+            await self.provider.edit_image(
+                source_path=source_path,
+                output_path=output_path,
+                plan=plan,
+                user_instruction=job.user_instruction,
+            )
+            self._finish_job(
+                job, source_path, output_image_id, output_filename, output_path
+            )
+
+    async def _render_native_mask(
+        self,
+        job: RetouchJob,
+        source_path,
+        plan,
+        output_image_id: str,
+        output_filename: str,
+        output_path,
+    ) -> None:
+        """Build the mask locally, edit only through it, then keep the pixels."""
+        mask_filename = f"mask_{uuid4().hex[:12]}.png"
+        mask_path = self.storage.config.outputs_dir / mask_filename
+        record: dict = {
+            "backend": self.provider.provider_name,
+            "model": self.provider.model_name,
+            "maskPath": f"/data/outputs/{mask_filename}",
+        }
+        # Record the intent up front so a failed build still leaves a trace of
+        # which mask file the run was supposed to use.
+        job.native_mask = record
+
+        build = self.native_mask.build_mask(source_path, mask_path)
+        record["mask"] = build.to_dict()
+
+        # The provider writes its own raw output; the kept pixels are only
+        # composited back by ``finalise`` once the raw output verifies.
+        raw_filename = f"raw_{output_image_id}{self.provider.output_extension}"
+        raw_path = self.storage.config.outputs_dir / raw_filename
+        await self.provider.edit_image(
+            source_path=source_path,
+            output_path=raw_path,
+            plan=plan,
+            user_instruction=job.user_instruction,
+            mask_path=mask_path,
+        )
+        record["rawPath"] = f"/data/outputs/{raw_filename}"
+
+        verification = self.native_mask.finalise(
+            source_path, raw_path, mask_path, output_path, mask_set=build.mask_set
+        )
+        record["verification"] = verification.to_dict()
+        job.native_mask = record
+
+        if verification.ok:
+            job.status = "succeeded"
+            job.output_image_ids = [output_image_id]
+            job.output_urls = [f"/data/outputs/{output_filename}"]
+            job.error_message = None
+        else:
+            # The kept pixels did not prove themselves the original's: the raw
+            # repaint is *not* published and no success status is written.
+            job.status = "failed"
+            job.output_image_ids = []
+            job.output_urls = []
+            job.error_message = (
+                "原生蒙版改造未通过像素身份校验"
+                "（PIXEL_IDENTITY_PASSED=false）："
+                + "；".join(verification.reasons or ["输出图与原图无法可靠配准"])
+                + "。已拒绝写入成功状态，请人工复核蒙版或改用整图后端。"
+            )
+        job.updated_at = datetime.now(timezone.utc)
+
     async def create_job_queued(self, request: CreateRetouchJobRequest) -> RetouchJob:
         """Create a job in 'queued' status without executing the AI workflow."""
         base_image_id = request.base_image_id or request.source_image_id
@@ -154,18 +257,7 @@ class RetouchService:
                 job.user_instruction,
             )
             job.plan = effective_plan
-            output_image_id = f"out_{uuid4().hex[:12]}"
-            output_filename = f"{output_image_id}{self.provider.output_extension}"
-            output_path = self.storage.config.outputs_dir / output_filename
-            await self.provider.edit_image(
-                source_path=source_path,
-                output_path=output_path,
-                plan=effective_plan,
-                user_instruction=job.user_instruction,
-            )
-            self._finish_job(
-                job, source_path, output_image_id, output_filename, output_path
-            )
+            await self._render(job, source_path, effective_plan)
         except Exception as exc:  # pragma: no cover - defensive status capture
             job.status = "failed"
             job.error_message = str(exc)
@@ -207,18 +299,7 @@ class RetouchService:
                 request.user_instruction,
             )
             job.plan = effective_plan
-            output_image_id = f"out_{uuid4().hex[:12]}"
-            output_filename = f"{output_image_id}{self.provider.output_extension}"
-            output_path = self.storage.config.outputs_dir / output_filename
-            await self.provider.edit_image(
-                source_path=source_path,
-                output_path=output_path,
-                plan=effective_plan,
-                user_instruction=request.user_instruction,
-            )
-            self._finish_job(
-                job, source_path, output_image_id, output_filename, output_path
-            )
+            await self._render(job, source_path, effective_plan)
         except Exception as exc:  # pragma: no cover - defensive status capture
             job.status = "failed"
             job.error_message = str(exc)
@@ -231,7 +312,14 @@ class RetouchService:
         provider: ImageEditProvider,
         brain: PromptBrain,
     ) -> "RetouchService":
-        return RetouchService(self.storage, self.jobs, provider, brain, self.settings)
+        return RetouchService(
+            self.storage,
+            self.jobs,
+            provider,
+            brain,
+            self.settings,
+            native_mask=self.native_mask,
+        )
 
     def get_job(self, job_id: str) -> RetouchJob:
         return self.jobs.get(job_id)

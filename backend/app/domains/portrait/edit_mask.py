@@ -36,13 +36,17 @@ What is real and what is a stand-in
   labels them per pixel, which is what replaces the P2.6 ellipse: the hair mask
   follows this subject's actual silhouette, and a new hairstyle may grow a
   bounded margin *outside* it instead of being pinned inside it.
-* **The parsed face island is protected whole.** ATR has no neck class, so the
-  neck comes back as ``Face``; the guard is therefore the full parsed face+neck
-  island unioned with the MediaPipe oval, not a skin-tone-filtered subset. A
-  shadowed neck is skin that fails a skin-tone test, and a throat that became
-  editable would be repainted by a garment swap. The subject's own skin tone is
-  still sampled, but now only as a quality signal on the parse
-  (``faceSkinShare``) instead of as a subtraction.
+* **The parsed face island is protected whole -- minus a collar it mistook for
+  anatomy.** ATR has no neck class, so the neck comes back as ``Face``; the
+  guard is therefore the full parsed face+neck island unioned with the MediaPipe
+  oval, not a skin-tone-filtered subset. A shadowed neck is skin that fails a
+  skin-tone test, and a throat that became editable would be repainted by a
+  garment swap. The single carve-out is the region *below the chin row* that is
+  **not** the subject's own skin: a white collar is a garment, not a face, and
+  freezing it with the face is what previously stopped a new outfit from ever
+  reaching the neckline. The neck skin below the chin is measured and stays
+  protected. The subject's own skin tone is sampled both for that split and as a
+  quality signal on the parse (``faceSkinShare``).
 * **Speckle parses are dropped, not shipped.** The net sometimes tags a sliver
   of background at the frame edge as hair or as a garment. Grown by a rim, that
   sliver opens a patch of background to the generator, so islands below a
@@ -144,6 +148,14 @@ class EditMaskSet:
     #: The parsed face/neck island *before* the skin and identity guards are
     #: unioned in: what the parser said, kept for review and for the gap report.
     parsed_face: Any = None
+    #: The anatomy half of the parse: the parsed face/neck island with the
+    #: garment the parser mistook for the jaw carved out. This is what the
+    #: protected guard is built from.
+    face_core: Any = None
+    #: The piece carved out of the parsed face: a collar the parser labelled
+    #: ``Face``. It joins the clothing region. Empty on the geometric path and
+    #: whenever the chin split did not apply.
+    collar: Any = None
 
     @property
     def semantic(self) -> bool:
@@ -334,6 +346,18 @@ class SemanticMaskConfig:
     #: A parsed island smaller than this share of the largest island is speckle
     #: (a background sliver mislabelled as hair or garment) and is dropped.
     component_floor_ratio: float = 0.05
+    #: Split the parsed face at the chin so a garment the parser filed as
+    #: ``Face`` -- a high collar that rises to the jaw -- becomes editable while
+    #: the throat stays protected. Needs the subject's own skin tone; if no
+    #: sample can be taken the island is protected whole and the gap is reported
+    #: rather than guessed at.
+    collar_split_enabled: bool = True
+    #: Parsed-``Face`` rows below ``CHIN + this * face width`` are candidates for
+    #: the split, so the jaw itself can never be handed to a garment.
+    collar_margin_ratio: float = 0.02
+    #: Below this many pixels the non-skin mass below the chin is treated as
+    #: noise rather than as a collar, and the parsed island is kept whole.
+    collar_min_pixels: int = 64
 
 
 def build_semantic_edit_masks(
@@ -414,15 +438,84 @@ def build_semantic_edit_masks(
     #    is unioned in so a sloppy parse edge cannot leave a sliver of cheek
     #    unprotected.
     parsed_face = _class_mask(labels, FACE_CLASSES)
-    oval = fill_polygon(shape, _hull(lm[list(FACE_OVAL)]))
-    island = np.maximum(parsed_face, oval)
-    protected_face = dilate_mask(island, cfg.face_grow_ratio * face_w)
 
-    # The subject's own skin tone is still sampled, but only as a quality
-    # signal on the parse (faceSkinShare); it is not allowed to punch holes in
-    # the guard, because the shadowed neck is skin that fails the test.
+    # 3a. The subject's own skin tone, sampled once. It is needed *before* the
+    #     island is built, because one thing filed as Face on this photo is not
+    #     anatomy: a high collar rises to the jaw and ATR has no collar class to
+    #     put it in. Below the chin row that sample is what separates a garment
+    #     from the throat; above it nothing is ever carved out.
     reference, sample_px = skin_reference_colour(image, lm, face_w)
-    if reference is None:
+    skin_mask = (
+        adaptive_skin_mask(image, reference, face_w, lock_cfg)
+        if reference is not None
+        else None
+    )
+
+    # 3b. Split the parse at the chin. Parsed-Face pixels below the chin row
+    #     that are *not* the subject's skin are a collar, not anatomy, and are
+    #     handed to the clothing region so a new outfit can replace them.
+    #     Below-chin pixels that *are* skin are the throat and stay protected.
+    #     When the two cannot be told apart the island is kept whole and the gap
+    #     is reported -- never silently called good.
+    collar = np.zeros(shape, np.uint8)
+    collar_pixels = 0
+    neck_skin_pixels = 0
+    collar_split_applied = False
+    if cfg.collar_split_enabled:
+        chin_y = float(lm[CHIN][1]) + cfg.collar_margin_ratio * face_w
+        below_chin = np.zeros(shape, np.uint8)
+        below_chin[max(int(round(chin_y)), 0) :, :] = 255
+        below_face = cv2.bitwise_and(parsed_face, below_chin)
+        if int((below_face > 0).sum()) > 0:
+            if skin_mask is None:
+                gaps.append(
+                    "collar_split_unresolved: the parser filed pixels below the "
+                    "chin as Face and no skin tone could be sampled to separate a "
+                    "collar from the throat, so the island was protected whole -- "
+                    "a garment at the neckline would not be editable. Fix the skin "
+                    "sample or correct the mask by hand before a paid generation"
+                )
+            else:
+                neck_skin_pixels = int(
+                    (cv2.bitwise_and(below_face, skin_mask) > 0).sum()
+                )
+                candidate = cv2.bitwise_and(
+                    below_face, cv2.bitwise_not(skin_mask)
+                )
+                candidate_pixels = int((candidate > 0).sum())
+                if candidate_pixels >= cfg.collar_min_pixels:
+                    collar = candidate
+                    collar_pixels = candidate_pixels
+                    collar_split_applied = True
+                else:
+                    gaps.append(
+                        "collar_split_found_nothing: the parse reached below the "
+                        f"chin but the non-skin mass there was {candidate_pixels} px "
+                        f"(< {cfg.collar_min_pixels}), too small to be a collar; the "
+                        "parsed face/neck island was protected whole"
+                    )
+
+    face_core = cv2.bitwise_and(parsed_face, cv2.bitwise_not(collar))
+    oval = fill_polygon(shape, _hull(lm[list(FACE_OVAL)]))
+    # The oval is unioned in last and the collar subtracted again, so the
+    # carve-out cannot be undone by a chin landmark that sits a hair low.
+    island = cv2.bitwise_and(
+        np.maximum(face_core, oval), cv2.bitwise_not(collar)
+    )
+    # The guard is grown so a parse that stops a pixel short of the jaw cannot
+    # leave a rim of cheek editable, and then the collar is subtracted again:
+    # the rim must not grow *over* the garment we just measured, or the top of
+    # the collar would be frozen right back onto the face. ``collar`` is all
+    # zeros when the split did not apply, so this is a no-op on the old path.
+    protected_face = cv2.bitwise_and(
+        dilate_mask(island, cfg.face_grow_ratio * face_w),
+        cv2.bitwise_not(collar),
+    )
+
+    # The subject's own skin tone is also kept as a quality signal on the parse
+    # (faceSkinShare); it is not allowed to punch holes in the guard, because the
+    # shadowed neck is skin that fails the test.
+    if skin_mask is None:
         face_skin = island
         gaps.append(
             "skin_reference_unavailable: the face was too small or too stylised "
@@ -430,9 +523,7 @@ def build_semantic_edit_masks(
             "protected without a skin-tone cross-check"
         )
     else:
-        face_skin = cv2.bitwise_and(
-            island, adaptive_skin_mask(image, reference, face_w, lock_cfg)
-        )
+        face_skin = cv2.bitwise_and(island, skin_mask)
     island_pixels = max(int((island > 0).sum()), 1)
     face_skin_pixels = int((face_skin > 0).sum())
 
@@ -454,6 +545,13 @@ def build_semantic_edit_masks(
     #    (so skin, the neck and the face survive a garment swap).
     parsed_clothing = _class_mask(labels, CLOTHING_CLASSES)
     parsed_clothing, clothing_cleanup = _drop_speckle(parsed_clothing, cfg)
+    # The collar carved out of the parsed face joins the garment region, which
+    # is the whole point of the split: on the old mask it was frozen with the
+    # face, so a new outfit could never reach the neckline. It is merged *after*
+    # the speckle filter because it is geometry this module measured, not a
+    # parsed island to prune.
+    if collar_split_applied:
+        parsed_clothing = np.maximum(parsed_clothing, collar)
     clothing = cv2.bitwise_and(
         dilate_mask(parsed_clothing, cfg.clothing_grow_ratio * face_w),
         cv2.bitwise_not(protected),
@@ -515,6 +613,14 @@ def build_semantic_edit_masks(
         "grown by a rim, not a per-strand matte; wispy strands against the "
         "background may fall outside it"
     )
+    if collar_split_applied:
+        gaps.append(
+            "collar_split_is_tone_based: the pixels below the chin that were moved "
+            "out of the face island and into the clothing region were separated by "
+            "the subject's own skin tone, not by a garment class -- a shadowed "
+            "throat or a skin-toned collar is the one case that needs an eye "
+            "before a paid generation"
+        )
 
     stats: Graph = {
         "imageWidth": width,
@@ -535,6 +641,14 @@ def build_semantic_edit_masks(
         "faceSkinPixels": face_skin_pixels,
         "parsedFacePixels": int((parsed_face > 0).sum()),
         "parsedFaceIslandPixels": island_pixels,
+        "faceCorePixels": int((face_core > 0).sum()),
+        "collarSplitEnabled": bool(cfg.collar_split_enabled),
+        "collarSplitApplied": bool(collar_split_applied),
+        "collarReclassifiedPixels": int(collar_pixels),
+        "collarEditablePixels": int(
+            (cv2.bitwise_and(collar, editable) > 0).sum()
+        ),
+        "neckSkinProtectedPixels": int(neck_skin_pixels),
         "faceSkinShare": round(face_skin_pixels / island_pixels, 4),
         "backgroundPreservePixels": int((background_preserve > 0).sum()),
         "backgroundEditablePixels": background_editable,
@@ -570,6 +684,8 @@ def build_semantic_edit_masks(
         background_preserve=background_preserve,
         label_map=labels.astype(np.uint8, copy=False),
         parsed_face=parsed_face,
+        face_core=face_core,
+        collar=collar,
     )
 
 

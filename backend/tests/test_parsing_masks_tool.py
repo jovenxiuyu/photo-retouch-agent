@@ -178,6 +178,7 @@ def test_tool_writes_every_mask_from_a_real_label_map(review_scene):
         "faceFeaturesAreInsideProtected",
         "glassesBandIsInsideProtected",
         "clothingDoesNotCoverTheFace",
+        "staleCollarEntersEditArea",
         "newHairstyleMayExceedOldHair",
         "labelMapIsRealSegmentation",
     }

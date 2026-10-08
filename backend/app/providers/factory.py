@@ -5,6 +5,7 @@ from typing import Any
 from app.core.config import Settings, settings
 from app.core.errors import bad_request
 from app.providers.base import ImageEditProvider
+from app.providers.fal_inpainting_provider import FalInpaintingProvider
 from app.providers.mock_image_provider import MockImageProvider
 from app.providers.qwen_image_provider import QwenImageProvider
 from app.providers.registry import ImageProviderPlugin, ImageProviderRegistry
@@ -53,6 +54,8 @@ class ImageProviderFactory:
             "seedreamModel": self.config.ark_image_model,
             "siliconflowConfigured": bool(self.config.siliconflow_api_key),
             "siliconflowImageModel": self.config.siliconflow_image_model,
+            "falInpaintConfigured": bool(self.config.fal_key),
+            "falInpaintModel": self.config.fal_inpaint_model,
             "workspaceConfigured": bool(
                 self.config.dashscope_workspace_id or self.config.dashscope_endpoint
             ),
@@ -114,6 +117,19 @@ class ImageProviderFactory:
                     "SiliconFlow Image",
                     self.config.siliconflow_image_model,
                     bool(self.config.siliconflow_api_key),
+                ),
+            )
+        )
+        self.register(
+            ImageProviderPlugin(
+                plugin_id="fal-inpaint",
+                aliases=("fal", "qwen-inpaint"),
+                build=self._create_fal_inpainting_provider,
+                capability=lambda: self._capability(
+                    "fal-inpaint",
+                    "fal.ai Qwen Inpaint",
+                    self.config.fal_inpaint_model,
+                    bool(self.config.fal_key),
                 ),
             )
         )
@@ -194,6 +210,27 @@ class ImageProviderFactory:
             model_name=self.config.siliconflow_image_model,
             timeout_seconds=self.config.provider_timeout_seconds,
             download_limit_bytes=self.config.provider_download_limit_bytes,
+        )
+
+    def _create_fal_inpainting_provider(
+        self,
+        api_key: str | None,
+        _workspace_id: str | None,
+    ) -> ImageEditProvider:
+        resolved_key = self._require_key(
+            api_key,
+            self.config.fal_key,
+            "fal.ai",
+            "FAL_KEY",
+        )
+        return FalInpaintingProvider(
+            api_key=resolved_key,
+            endpoint=self.config.fal_inpaint_endpoint,
+            model_name=self.config.fal_inpaint_model,
+            timeout_seconds=self.config.provider_timeout_seconds,
+            download_limit_bytes=self.config.provider_download_limit_bytes,
+            poll_interval_seconds=self.config.fal_inpaint_poll_interval_seconds,
+            max_poll_seconds=self.config.fal_inpaint_max_poll_seconds,
         )
 
     @staticmethod

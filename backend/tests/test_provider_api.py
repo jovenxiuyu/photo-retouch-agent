@@ -95,6 +95,7 @@ def test_provider_capabilities_are_safe(client: TestClient) -> None:
         "wan",
         "seedream",
         "siliconflow",
+        "fal-inpaint",
         "mock",
     ]
     assert payload["brainProviders"][0]["visionMode"] == "direct"
