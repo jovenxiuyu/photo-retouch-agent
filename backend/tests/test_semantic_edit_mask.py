@@ -565,3 +565,118 @@ def test_a_shadowed_throat_stays_protected_instead_of_becoming_a_collar():
     collar_col = COLLAR_COLS[0] + 10
     assert shadow.editable[collar_row, collar_col] == 0
     assert shadow.protected[collar_row, collar_col] == 255
+
+
+# ------------------------------------------------- the chin-margin collar strip
+
+
+def test_a_collar_that_rises_to_the_jaw_is_not_frozen_by_the_split_margin():
+    """The split starts a margin below the chin, so the strip it skips stayed frozen.
+
+    On the reference photo that strip is the top edge of the old white knit
+    collar: ~805 px the last paid run could never repaint, printed as a pale
+    ghost under the chin. The recovery knob releases the well-evidenced part of
+    it -- a bright, neutral fabric beside the collar -- into the clothing region.
+    """
+    wide_margin = 0.06
+    frozen = build_semantic_edit_masks(
+        _collar_image(),
+        _landmarks(),
+        _collar_labels(),
+        config=SemanticMaskConfig(
+            collar_margin_ratio=wide_margin, collar_margin_recovery_enabled=False
+        ),
+    )
+    released = build_semantic_edit_masks(
+        _collar_image(),
+        _landmarks(),
+        _collar_labels(),
+        config=SemanticMaskConfig(collar_margin_ratio=wide_margin),
+    )
+
+    chin_row = int(round(FACE_CY + FACE_RY))
+    # The rows the chin margin freezes: from the chin down to where the split
+    # line begins. The release is evidence-gated, so it lifts only the rows that
+    # carry independent garment evidence -- the rest of the strip stays frozen.
+    strip = slice(chin_row, chin_row + 5)
+    collar_col = COLLAR_COLS[0] + 10
+
+    frozen_strip = frozen.protected[strip, collar_col]
+    released_strip = released.protected[strip, collar_col]
+
+    # Without the knob the whole strip between the chin and the split line is
+    # frozen and uneditable.
+    assert frozen_strip.min() == 255
+    assert frozen.editable[strip, collar_col].max() == 0
+
+    # With it, the well-evidenced rows of that same strip leave the guard and
+    # land in the clothing region...
+    freed = (frozen_strip == 255) & (released_strip == 0)
+    assert freed.any()
+    assert released.editable[strip, collar_col][freed].min() == 255
+    assert released.clothing[strip, collar_col][freed].min() == 255
+    # ...while the rows with no such evidence keep the guard, so the carve stays
+    # measured instead of dropping the whole chin margin on the floor.
+    assert not freed.all()
+
+    recovered = released.stats["collarMarginRecoveredPixels"]
+    assert recovered > 0
+    assert recovered == int((frozen.protected > 0).sum()) - int(
+        (released.protected > 0).sum()
+    )
+    assert released.stats["collarMarginRecoveredEditablePixels"] == recovered
+    assert released.stats["collarMarginRecoveredStillProtectedPixels"] == 0
+    assert "collar_margin_recovery_is_tone_based" in " ".join(released.gaps)
+
+
+def test_collar_margin_recovery_never_frees_skin_the_face_or_the_glasses():
+    """The release is narrow by construction: it cannot touch a guarded pixel."""
+    frozen = build_semantic_edit_masks(
+        _collar_image(),
+        _landmarks(),
+        _collar_labels(),
+        config=SemanticMaskConfig(
+            collar_margin_ratio=0.06, collar_margin_recovery_enabled=False
+        ),
+    )
+    released = build_semantic_edit_masks(
+        _collar_image(),
+        _landmarks(),
+        _collar_labels(),
+        config=SemanticMaskConfig(collar_margin_ratio=0.06),
+    )
+
+    freed = (frozen.protected > 0) & (released.protected == 0)
+    assert freed.any()
+
+    # The throat strip inside the very same band is skin and stays kept.
+    neck_col = (NECK_COLS[0] + NECK_COLS[1]) // 2
+    assert not freed[:, neck_col].any()
+    assert released.protected[300, neck_col] == 255
+
+    # Neither guard loses a single pixel, and the total protected area only
+    # shrinks by exactly what was handed to the garment.
+    assert released.stats["neckSkinProtectedPixels"] == frozen.stats["neckSkinProtectedPixels"]
+    assert released.stats["identityGuardPixels"] == frozen.stats["identityGuardPixels"]
+    assert released.stats["glassesGuardPixels"] == frozen.stats["glassesGuardPixels"]
+    assert (
+        frozen.stats["protectedPixels"] - released.stats["protectedPixels"]
+        == int(freed.sum())
+    )
+    # Every freed pixel is a garment pixel now, not an uneditable gap.
+    assert int((released.clothing[freed] > 0).sum()) == int(freed.sum())
+    # The hair/clothing seam is unchanged: the release happens below the hair.
+    assert released.stats["hairOverClothingRimPixels"] == frozen.stats["hairOverClothingRimPixels"]
+
+
+def test_collar_margin_recovery_off_reproduces_the_last_accepted_mask():
+    """The knob is additive: off is byte-for-byte the mask that was accepted."""
+    off = build_semantic_edit_masks(
+        _collar_image(),
+        _landmarks(),
+        _collar_labels(),
+        config=SemanticMaskConfig(collar_margin_recovery_enabled=False),
+    )
+    assert off.stats["collarMarginRecoveredPixels"] == 0
+    assert off.stats["collarMarginRecoveryEnabled"] is False
+    assert off.stats["protectedCoversEditable"] is True

@@ -387,6 +387,30 @@ class SemanticMaskConfig:
     #: shadow under the jaw was handed to the garment and repainted, which is
     #: what left the grey cast on the underside of the chin.
     collar_skin_luma_ratio: float = 0.35
+    #: The split above only reaches rows at ``CHIN + collar_margin_ratio * face
+    #: width``, so a garment that rises to touch the jaw keeps a margin-height
+    #: band frozen with the face. On the reference photo that band is the top
+    #: edge of a white knit collar -- ~805 px the garment pass could never
+    #: repaint, and the last paid run printed it as a pale ghost under the chin.
+    #: When this is on, ``protected`` pixels below the chin row that pass the
+    #: *same* tests as the split (not the subject's skin, not the shadow under
+    #: the jaw) and carry independent evidence of being a garment are handed to
+    #: the clothing region as well. It can only ever release pixels the split
+    #: would already have released at a zero margin; the dark throat, the
+    #: identity guard, the spectacle band and every skin pixel stay protected.
+    collar_margin_recovery_enabled: bool = True
+    #: Independent evidence #1: the proximity ring around the collar and the
+    #: parsed garment within which recovered pixels must sit. Bounds the release
+    #: to the collar's own neighbourhood, as a fraction of the face width.
+    collar_margin_recovery_ring_ratio: float = 0.02
+    #: Independent evidence #2: a pixel brighter than this share of the
+    #: subject's *own* skin luminance is brighter than skin that was sampled at
+    #: all, so it cannot be a shadowed throat. Paired with the chroma ceiling
+    #: below it isolates a fabric highlight instead of lit skin.
+    collar_margin_recovery_luma_ratio: float = 0.90
+    #: Chroma ceiling (max channel - min channel) for "neutral fabric": skin
+    #: keeps a high red-minus-blue spread even in shadow, a white knit does not.
+    collar_margin_recovery_chroma: float = 45.0
 
 
 def build_semantic_edit_masks(
@@ -600,6 +624,86 @@ def build_semantic_edit_masks(
 
     protected = np.maximum(np.maximum(features, glasses), protected_face)
 
+    # 3c. Recover the band the chin margin leaves behind. The split above starts
+    #     at CHIN + collar_margin_ratio * face_w, so a garment that rises to the
+    #     jaw keeps a margin-height strip frozen with the face. Measured against
+    #     the reference photo that strip is the top edge of the old white knit
+    #     collar: the last paid run could not reach it and printed it as a pale
+    #     ghost. A pixel is released only when it is below the chin row, is not
+    #     the subject's skin, is not the dark shadow under the jaw, and carries
+    #     independent evidence of being a garment -- the parser's own
+    #     Upper-clothes label, or a bright neutral highlight sitting on the
+    #     collar's rim. Nothing else moves: the identity guard, the spectacle
+    #     band and the skin tone are subtracted back out and the count that had
+    #     to be dropped is reported.
+    collar_recovery = np.zeros(shape, np.uint8)
+    recovery_pixels = 0
+    recovery_bright_pixels = 0
+    recovery_parsed_garment_pixels = 0
+    recovery_guard_refused_pixels = 0
+    if (
+        cfg.collar_split_enabled
+        and cfg.collar_margin_recovery_enabled
+        and skin_mask is not None
+        and reference is not None
+        and int((collar > 0).sum()) > 0
+    ):
+        chin_row = float(lm[CHIN][1])
+        below_row = np.zeros(shape, np.uint8)
+        below_row[max(int(round(chin_row)), 0) :, :] = 255
+        ref_luma = float(
+            _luma(np.asarray(reference, dtype=np.float32).reshape(1, 1, 3))[0, 0]
+        )
+        luma = _luma(image)
+        chroma = _chroma(image)
+        luma_floor = np.where(
+            luma >= cfg.collar_skin_luma_ratio * ref_luma, 255, 0
+        ).astype(np.uint8)
+        parsed_garment = _class_mask(labels, CLOTHING_CLASSES)
+        ring = dilate_mask(
+            np.maximum(collar, parsed_garment),
+            cfg.collar_margin_recovery_ring_ratio * face_w,
+        )
+        bright = np.where(
+            (luma > cfg.collar_margin_recovery_luma_ratio * ref_luma)
+            & (chroma < cfg.collar_margin_recovery_chroma),
+            255,
+            0,
+        ).astype(np.uint8)
+        evidence = np.maximum(
+            cv2.bitwise_and(parsed_garment, ring),
+            cv2.bitwise_and(bright, ring),
+        )
+        candidate = cv2.bitwise_and(protected, below_row)
+        candidate = cv2.bitwise_and(candidate, cv2.bitwise_not(skin_mask))
+        candidate = cv2.bitwise_and(candidate, luma_floor)
+        candidate = cv2.bitwise_and(candidate, evidence)
+        refused = cv2.bitwise_and(
+            candidate, np.maximum(np.maximum(features, glasses), parsed_hair)
+        )
+        recovery_guard_refused_pixels = int((refused > 0).sum())
+        candidate = cv2.bitwise_and(candidate, cv2.bitwise_not(refused))
+        collar_recovery = candidate
+        recovery_pixels = int((collar_recovery > 0).sum())
+        if recovery_pixels > 0:
+            recovery_bright_pixels = int(
+                (cv2.bitwise_and(collar_recovery, bright) > 0).sum()
+            )
+            recovery_parsed_garment_pixels = int(
+                (cv2.bitwise_and(collar_recovery, parsed_garment) > 0).sum()
+            )
+            gaps.append(
+                "collar_margin_recovery_is_tone_based: the "
+                f"{recovery_pixels} px the chin margin had frozen with the face "
+                "were released to the clothing region on the parser's garment "
+                "label and on a bright-neutral-fabric test; a skin-toned collar "
+                "or a white sleeve in identical light is the one case that "
+                "still needs an eye before a paid generation"
+            )
+            protected = cv2.bitwise_and(
+                protected, cv2.bitwise_not(collar_recovery)
+            )
+
     # 4. Hair: the parsed silhouette with its speckle dropped, grown by a
     #    bounded rim so a longer, fuller or differently shaped hairstyle is
     #    allowed, then cut back by the face guard so the forehead and jaw
@@ -737,6 +841,17 @@ def build_semantic_edit_masks(
         "collarEditablePixels": int(
             (cv2.bitwise_and(collar, editable) > 0).sum()
         ),
+        "collarMarginRecoveryEnabled": bool(cfg.collar_margin_recovery_enabled),
+        "collarMarginRecoveredPixels": recovery_pixels,
+        "collarMarginRecoveredBrightPixels": recovery_bright_pixels,
+        "collarMarginRecoveredParsedGarmentPixels": recovery_parsed_garment_pixels,
+        "collarMarginRecoveryRefusedByGuardPixels": recovery_guard_refused_pixels,
+        "collarMarginRecoveredEditablePixels": int(
+            (cv2.bitwise_and(collar_recovery, editable) > 0).sum()
+        ),
+        "collarMarginRecoveredStillProtectedPixels": int(
+            (cv2.bitwise_and(collar_recovery, protected) > 0).sum()
+        ),
         "neckSkinProtectedPixels": int(neck_skin_pixels),
         "hairGuardReleasePixels": int(guard_release_pixels),
         "hairFrozenByGuardPixels": int(
@@ -804,6 +919,16 @@ def _luma(image_rgb: Any) -> Any:
     """
     f = np.asarray(image_rgb, dtype=np.float32)
     return 0.299 * f[..., 0] + 0.587 * f[..., 1] + 0.114 * f[..., 2]
+
+
+def _chroma(image_rgb: Any) -> Any:
+    """Max-minus-min channel of an RGB image: saturation on an 8-bit scale.
+
+    Skin keeps a wide red-to-blue spread even in shadow, so a bright *and*
+    narrow-spread pixel is a fabric highlight rather than lit skin.
+    """
+    f = np.asarray(image_rgb, dtype=np.float32)
+    return f.max(axis=-1) - f.min(axis=-1)
 
 
 def _drop_speckle(

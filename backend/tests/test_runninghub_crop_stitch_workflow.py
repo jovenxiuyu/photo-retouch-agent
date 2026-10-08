@@ -184,6 +184,28 @@ def test_clothing_prompt_pins_a_closed_collar_and_rules_out_a_deep_v():
     assert "statement necklace" in prompts["negative"]
 
 
+def test_the_collar_clause_pins_the_collar_to_the_blouse_colour():
+    """The last run closed the neckline but kept ~10.5k px of old off-white knit.
+
+    A collar that is only "higher and closed" still lets the sampler leave the
+    fabric already at the neck, so the clause now names the colour and the
+    negative terms rule out a second, lighter layer.
+    """
+    prompts = rh.build_prompts(_bundle())
+
+    assert "olive-green" in prompts["clothing"]
+    assert "lining" in prompts["clothing"]
+    assert "scarf" in prompts["negative"]
+    assert "undershirt" in prompts["negative"]
+    assert "beige collar lining" in prompts["negative"]
+
+
+def test_the_collar_negative_terms_name_no_person_and_no_facial_feature():
+    """The negative list is clipped too, so it must stay free of anatomy words."""
+    for term in rh.COLLAR_NEGATIVE_TERMS:
+        assert rh.FORBIDDEN_POSITIVE_PATTERN.search(term) is None
+
+
 def test_the_collar_clause_does_not_smuggle_a_facial_feature_back_in():
     prompts = rh.build_prompts(_bundle())
 

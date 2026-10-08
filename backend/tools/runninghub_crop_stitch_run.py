@@ -156,9 +156,16 @@ NECKLACE_CLAUSE = "worn with a slim metal necklace"
 # on the positive side as well -- a higher natural collar closed near the
 # collarbone, with the vintage folds the plan asks for -- so "follow the existing
 # garment" does not read as "open the front".
+# The second billed run closed the neckline but did not recolour it: both the
+# Clothing Pass and the FINAL kept ~10.5k px of the *old* off-white knit at
+# the neck -- a pale vertical strip and a pale patch under the jaw, present in
+# the Clothing Pass itself and therefore not a hair-pass artefact. The clause is
+# now pinned on the colour side as well, so "a higher collar" cannot be read as
+# "keep whatever light fabric already sits there".
 COLLAR_CLAUSE = (
-    "a higher natural collar closed near the collarbone with fine pleats and "
-    "soft vintage folds"
+    "a higher natural collar closed near the collarbone, cut from the same deep "
+    "olive-green cloth as the blouse, its inner lining and its folds all in that "
+    "same deep olive-green tone, with fine pleats and soft vintage folds"
 )
 
 # The neckline artefacts the plan rules out, carried as negative terms so the
@@ -172,6 +179,19 @@ COLLAR_NEGATIVE_TERMS = (
     "bare cleavage",
     "sheer mesh shoulder",
     "statement necklace",
+    # The garment being replaced is an off-white textured knit, so every term
+    # above still left the sampler free to keep a light layer at the neck. These
+    # rule out a second, lighter layer -- a white/beige collar lining, a scarf or
+    # an inner top -- which is what the last run printed as the pale residual.
+    "white collar",
+    "cream collar",
+    "beige collar lining",
+    "white inner layer",
+    "pale knit at the neckline",
+    "white scarf",
+    "beige knitted scarf",
+    "white undershirt",
+    "ivory lining",
 )
 
 # ``hair_prompt`` names the hair being replaced. At denoise below 1.0 a
