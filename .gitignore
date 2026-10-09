@@ -61,3 +61,11 @@ evidence/p29-fix-run/*
 evidence/p29-neck-fix/*
 !evidence/p29-neck-fix/*.json
 !evidence/p29-neck-fix/*.py
+
+# P2.9 collar-residual single-pass repair: the frozen-final crops, mask previews
+# and zoom renders all reproduce the subject's own photo, so they stay
+# local-only. The write-up is evidence/p29-collar-repair-report.md; keep the
+# derived stats and the offline probe scripts, which hold no image data.
+evidence/p29-collar-repair/*
+!evidence/p29-collar-repair/*.json
+!evidence/p29-collar-repair/*.py

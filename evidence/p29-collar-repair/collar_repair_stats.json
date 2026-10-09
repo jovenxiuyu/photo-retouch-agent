@@ -1,0 +1,81 @@
+{
+ "generated_at": "2026-10-09T00:14:56.479411+00:00",
+ "tool": "tools.build_collar_repair_mask",
+ "baseline_final": "evidence/p29-submit-run/final.png",
+ "original": "data/inputs/IMG_3651.jpg",
+ "labels": "evidence/p29-collar-repair/labels_fresh.png",
+ "size": [
+  904,
+  1190
+ ],
+ "face_width_px": 256.72,
+ "chin_px": [
+  486.61,
+  594.19
+ ],
+ "window_px": 55968,
+ "window_bbox": [
+  327,
+  594,
+  678,
+  752
+ ],
+ "no_edit_px": 963857,
+ "rules": {
+  "pale_fabric": "final luma > 132 and 25 < chroma < 72",
+  "source_knit": "original luma > 140 and chroma < 50",
+  "skin": "adaptive skin mask of the subject's own face sample, on the original",
+  "olive_blouse": "final hue 45-115 at saturation > 0.12 is kept",
+  "guards": "protected (identity/glasses/chin/throat) and parsed hair and background are kept"
+ },
+ "counts": {
+  "pale_fabric_px": 120027,
+  "source_knit_px": 209309,
+  "residual_px": 3282,
+  "release_px": 3291,
+  "release_px_in_collar_class": 2583,
+  "release_px_in_clothing_class": 3291,
+  "release_px_over_still_pale_original": 3288,
+  "release_over_hair_px": 0,
+  "release_over_background_px": 0,
+  "release_over_protected_px": 0,
+  "blocked_by_identity_px": 0,
+  "dilated_over_protected_px": 0
+ },
+ "release_bbox": [
+  444,
+  594,
+  560,
+  709
+ ],
+ "release_blobs": [
+  {
+   "px": 2761,
+   "bbox": [
+    444,
+    630,
+    96,
+    80
+   ]
+  },
+  {
+   "px": 530,
+   "bbox": [
+    526,
+    594,
+    35,
+    25
+   ]
+  }
+ ],
+ "guarded_pale_px": 3007,
+ "guarded_pale_bbox": [
+  437,
+  594,
+  566,
+  726
+ ],
+ "guarded_pale_note": "pale cloth in the final inside the same collar band, held back by the subject's own skin guard on the original; keep-vs-remove conflict, reported for the operator to decide",
+ "blocked_by_identity_bbox": null,
+ "blocked_by_identity_blobs": []
+}
