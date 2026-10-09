@@ -14,6 +14,24 @@ def _optional_env(name: str) -> str | None:
     return value or None
 
 
+def _runninghub_key() -> str | None:
+    """The RunningHub key, from the environment or the local key file.
+
+    The CLI has always read ``~/.runninghub_key``; the app reads the same file so
+    a developer who already has one does not have to duplicate the secret. The
+    value is never logged and the field is ``repr=False``.
+    """
+    value = _optional_env("RUNNINGHUB_API_KEY")
+    if value:
+        return value
+    key_file = Path.home() / ".runninghub_key"
+    try:
+        text = key_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return text or None
+
+
 @dataclass(frozen=True)
 class Settings:
     app_name: str = "Photo Retouch Agent API"
@@ -240,6 +258,53 @@ class Settings:
     )
     fal_inpaint_max_poll_seconds: float = field(
         default_factory=lambda: float(os.getenv("FAL_INPAINT_MAX_POLL", "600"))
+    )
+
+    # --- RunningHub CropAndStitch (the validated two-pass masked edit) -----
+    # The one backend whose exact graph produced an accepted result
+    # (RunningHub task 2108330225116082177). Like the fal path it *requires* a
+    # black/white edit mask and never falls back to a whole-image edit. Wiring
+    # it is free; a task is only billed when the user confirms the cost in the
+    # UI and the job layer dispatches it exactly once.
+    runninghub_api_key: str | None = field(
+        default_factory=lambda: _runninghub_key(),
+        repr=False,
+    )
+    runninghub_base_url: str = field(
+        default_factory=lambda: (
+            _optional_env("RUNNINGHUB_BASE_URL") or "https://www.runninghub.cn"
+        ).rstrip("/")
+    )
+    # ``workflowId`` is a required non-null field even when the graph travels
+    # inline in ``workflow``; the API documents that ``workflow`` wins.
+    runninghub_workflow_id: str = field(
+        default_factory=lambda: os.getenv("RUNNINGHUB_WORKFLOW_ID", "1").strip() or "1"
+    )
+    runninghub_instance_type: str = field(
+        default_factory=lambda: os.getenv("RUNNINGHUB_INSTANCE_TYPE", "default").strip() or "default"
+    )
+    runninghub_checkpoint: str = field(
+        default_factory=lambda: os.getenv(
+            "RUNNINGHUB_CHECKPOINT", "juggernautXL_juggXIByRundiffusion.safetensors"
+        ).strip()
+    )
+    runninghub_seed: int = field(
+        default_factory=lambda: int(os.getenv("RUNNINGHUB_SEED", "20261008"))
+    )
+    runninghub_timeout_seconds: float = field(
+        default_factory=lambda: float(os.getenv("RUNNINGHUB_TIMEOUT", "900"))
+    )
+    runninghub_poll_interval_seconds: float = field(
+        default_factory=lambda: float(os.getenv("RUNNINGHUB_POLL_INTERVAL", "6.0"))
+    )
+    #: Live ComfyUI node table. Optional: when the file is absent the workflow is
+    #: structurally validated only (the platform call is unaffected), so a fresh
+    #: checkout without the 30 MB dump still runs.
+    runninghub_object_info_path: Path = field(
+        default_factory=lambda: Path(
+            _optional_env("RUNNINGHUB_OBJECT_INFO")
+            or str(PROJECT_ROOT / "evidence" / "p29-live-run" / "object_info_live.json")
+        )
     )
 
     @property

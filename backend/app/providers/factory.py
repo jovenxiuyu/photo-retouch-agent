@@ -9,6 +9,9 @@ from app.providers.fal_inpainting_provider import FalInpaintingProvider
 from app.providers.mock_image_provider import MockImageProvider
 from app.providers.qwen_image_provider import QwenImageProvider
 from app.providers.registry import ImageProviderPlugin, ImageProviderRegistry
+from app.providers.runninghub_crop_stitch_provider import (
+    RunningHubCropStitchProvider,
+)
 from app.providers.seedream_image_provider import SeedreamImageProvider
 from app.providers.siliconflow_image_provider import SiliconFlowImageProvider
 
@@ -56,6 +59,9 @@ class ImageProviderFactory:
             "siliconflowImageModel": self.config.siliconflow_image_model,
             "falInpaintConfigured": bool(self.config.fal_key),
             "falInpaintModel": self.config.fal_inpaint_model,
+            "runninghubConfigured": bool(self.config.runninghub_api_key),
+            "runninghubModel": self.config.runninghub_checkpoint,
+            "runninghubProviderId": "runninghub-crop-stitch",
             "workspaceConfigured": bool(
                 self.config.dashscope_workspace_id or self.config.dashscope_endpoint
             ),
@@ -146,6 +152,42 @@ class ImageProviderFactory:
                     requires_api_key=False,
                 ),
             )
+        )
+        self.register(
+            ImageProviderPlugin(
+                plugin_id="runninghub-crop-stitch",
+                aliases=("runninghub",),
+                build=self._create_runninghub_provider,
+                capability=lambda: self._capability(
+                    "runninghub-crop-stitch",
+                    "RunningHub CropAndStitch",
+                    self.config.runninghub_checkpoint,
+                    bool(self.config.runninghub_api_key),
+                ),
+            )
+        )
+
+    def _create_runninghub_provider(
+        self,
+        api_key: str | None,
+        _workspace_id: str | None,
+    ) -> ImageEditProvider:
+        resolved_key = self._require_key(
+            api_key,
+            self.config.runninghub_api_key,
+            "RunningHub",
+            "RUNNINGHUB_API_KEY",
+        )
+        return RunningHubCropStitchProvider(
+            api_key=resolved_key,
+            base_url=self.config.runninghub_base_url,
+            workflow_id=self.config.runninghub_workflow_id,
+            instance_type=self.config.runninghub_instance_type,
+            seed=self.config.runninghub_seed,
+            timeout_seconds=self.config.runninghub_timeout_seconds,
+            poll_interval_seconds=self.config.runninghub_poll_interval_seconds,
+            checkpoint=self.config.runninghub_checkpoint,
+            object_info_path=self.config.runninghub_object_info_path,
         )
 
     def _create_qwen_provider(

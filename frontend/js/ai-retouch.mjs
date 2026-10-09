@@ -134,14 +134,25 @@ export async function executeAiRetouch({
     action,
   );
 
-  if (job.status !== "succeeded" || !job.outputUrls?.length) {
-    throw new Error(job.errorMessage || "AI 美化任务未生成结果。");
-  }
+  // ``POST /retouch/jobs`` answers 202 with a *queued* job -- the render runs
+  // on the backend dispatcher. Treating that reply as terminal reported
+  // "AI 美化任务未生成结果" the instant the request returned, even though the
+  // job was still running (and even when it later succeeded). Poll the job to
+  // its real outcome instead, exactly like the styling flow does.
+  const finished = await resolveJobUntilDone(api, job, {
+    failureMessage: "AI 美化任务未生成结果。",
+    timeoutMessage: "AI 美化生成超时，请稍后重试。",
+  });
 
-  return { photo, analysis, plans, plan, instruction, job };
+  return { photo, analysis, plans, plan, instruction, job: finished };
 }
 
-const STYLING_POLL_TIMEOUT_MS = 120000;
+// A masked RunningHub render can legitimately spend several minutes in the
+// provider queue, so the poll window is generous; the UI reports the job's own
+// ``stage`` while it waits, so a long wait is visible rather than silent.
+const STYLING_POLL_TIMEOUT_MS = 900000;
+// How often the job's ``stage`` is echoed back to the caller.
+const STYLING_POLL_INTERVAL_MS = 900;
 
 export function normalizeStylingProposals(proposals) {
   if (!Array.isArray(proposals) || proposals.length < 3) {
@@ -255,35 +266,64 @@ function stylingJobFailure(job, fallback) {
   // silently presenting it as a successful styling.
   error.faceLock = job?.faceLock || null;
   error.jobStatus = job?.status || "failed";
+  // Keep the whole job so the progress panel can mark the exact failed stage and
+  // the failure reason can be shown without a second lookup.
+  error.job = job || null;
   return error;
 }
 
-async function resolveStylingJob(api, created) {
+// Both the styling and the skin-retouch flows create jobs through the same 202
+// endpoint, so they share one poll-to-terminal helper. ``failureMessage`` is
+// used when the backend reports a failure (and as the fallback when no reason
+// is attached); ``timeoutMessage`` is used when the poll window is exhausted.
+async function resolveJobUntilDone(
+  api,
+  created,
+  { onStage, failureMessage, timeoutMessage },
+) {
+  const report = (job) => {
+    if (typeof onStage === "function") {
+      try {
+        onStage(job);
+      } catch (error) {
+        // Progress reporting must never break the render.
+      }
+    }
+  };
+  report(created);
   if (created?.status === "succeeded" && created.outputUrls?.length) {
     return created;
   }
   if (created?.status === "failed") {
-    throw stylingJobFailure(created, "AI 造型任务生成失败。");
+    throw stylingJobFailure(created, failureMessage);
   }
   if (!created?.jobId || typeof api.getJob !== "function") {
-    throw new Error(created?.errorMessage || "AI 造型任务未生成结果。");
+    throw new Error(created?.errorMessage || failureMessage);
   }
 
   const deadline = Date.now() + STYLING_POLL_TIMEOUT_MS;
-  let delay = 600;
+  let delay = STYLING_POLL_INTERVAL_MS;
   let job = created;
   while (Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, delay));
-    delay = Math.min(Math.round(delay * 1.5), 5000);
     job = await api.getJob(created.jobId);
+    report(job);
     if (job?.status === "failed") {
-      throw stylingJobFailure(job, "AI 造型任务生成失败。");
+      throw stylingJobFailure(job, failureMessage);
     }
     if (job?.status === "succeeded" && job.outputUrls?.length) {
       return job;
     }
   }
-  throw new Error("AI 造型生成超时，请稍后重试。");
+  throw new Error(timeoutMessage);
+}
+
+async function resolveStylingJob(api, created, onStage) {
+  return resolveJobUntilDone(api, created, {
+    onStage,
+    failureMessage: "AI 造型任务生成失败。",
+    timeoutMessage: "AI 造型生成超时，请稍后重试。",
+  });
 }
 
 export async function executeStyling({
@@ -294,6 +334,7 @@ export async function executeStyling({
   brain,
   action,
   api,
+  onStage,
 }) {
   const looks = normalizeStylingProposals(proposals);
   const proposal = looks.find(
@@ -314,7 +355,7 @@ export async function executeStyling({
     brain,
     action,
   );
-  const job = await resolveStylingJob(api, created);
+  const job = await resolveStylingJob(api, created, onStage);
   return { proposal, instruction, job };
 }
 
@@ -324,12 +365,13 @@ export async function refineStyling({
   brain,
   action,
   api,
+  onStage,
 }) {
   if (!jobId) throw new Error("请先生成一套造型，再进行二次修改。");
   const instruction = (userInstruction || "").trim();
   if (!instruction) throw new Error("请填写你的修改要求。");
 
   const created = await api.refineJob(jobId, instruction, brain, action);
-  const job = await resolveStylingJob(api, created);
+  const job = await resolveStylingJob(api, created, onStage);
   return { job };
 }

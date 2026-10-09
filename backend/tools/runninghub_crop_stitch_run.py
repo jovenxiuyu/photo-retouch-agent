@@ -1,865 +1,118 @@
-"""Submit ONE paid CropAndStitch local edit to RunningHub (P2.9).
+"""Thin CLI over :mod:`app.infrastructure.runninghub_crop_stitch`.
 
-Consumes a package produced by ``tools.build_local_edit_package`` and turns it
-into an inline ComfyUI workflow (API format) that runs the two-pass masked edit
-on RunningHub with the ``lquesada/ComfyUI-Inpaint-CropAndStitch`` nodes:
-
-    pass 1  clothing_edit_mask  on the original image
-    pass 2  hair_edit_mask      on pass 1's stitched output
-
-Pass order is not cosmetic. CropAndStitch composites as
-``new = mask * inpainted + (1 - mask) * canvas`` and each pass blends over the
-image the previous pass returned, so the mask that runs last owns the
-hair/clothing overlap band. Hair runs last on purpose: strands that fall over
-the new garment stay hair.
-
-Each pass is conditioned on the *original crop pixels* rather than on an empty
-latent: ``InpaintCropImproved`` feeds ``cropped_image`` / ``cropped_mask`` into
-``InpaintModelConditioning`` and the sampler takes its positive, negative and
-latent from that node, with ``denoise`` below 1.0. The first real run used
-``VAEEncodeForInpaint`` (which encodes a flat grey blob inside the mask) at
-``denoise=1.0``, so the model had no original signal to preserve and painted a
-second face and a second pair of glasses into the hair mask -- see
-``evidence/p29-fix-run/``.
-
-Everything is validated locally before anything is sent, because RunningHub
-creates a task (and then fails it) even when the workflow references a node the
-runtime does not have -- see ``evidence/p29-runninghub-live-audit.md``.
-
-Stages, from ``backend/``::
-
-    # build + validate only -- no network, no key needed
-    ../.venv/bin/python -m tools.runninghub_crop_stitch_run \
-        --package ../artifacts/local-edit-package/<stamp> --dry-run
-
-    # upload the three input files -- free
-    ../.venv/bin/python -m tools.runninghub_crop_stitch_run \
-        --package ../artifacts/local-edit-package/<stamp> --upload
-
-    # create the single billed task, poll it and download the result
-    ../.venv/bin/python -m tools.runninghub_crop_stitch_run \
-        --package ../artifacts/local-edit-package/<stamp> \
-        --submit --i-understand-this-costs-money
-
-The API key is read from ``~/.runninghub_key`` and is never printed.
+The graph, the prompt builder and every gate check live in the shared module so
+the web app and this CLI cannot drift apart. This file only keeps the command
+line usable: it re-exports the pieces other tools import (``tools/…`` scripts
+and ``evidence/…`` scripts import this module by name) and drives one run.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
-import time
 from pathlib import Path
 
 import httpx
 
-BASE_URL = "https://www.runninghub.cn"
-CREATE_PATH = "/task/openapi/create"
-STATUS_PATH = "/task/openapi/status"
-OUTPUTS_PATH = "/task/openapi/outputs"
-# The v2 binary upload endpoint rejects this account's key with errorCode 1000;
-# the classic task-scoped upload endpoint authenticates via the apiKey form
-# field and returns the server-side ``fileName`` that LoadImage consumes.
-UPLOAD_PATH = "/task/openapi/upload"
+from app.infrastructure.runninghub_crop_stitch import (
+    BASE_URL,
+    CHECKPOINT,
+    COLLAR_CLAUSE,
+    COLLAR_NEGATIVE_TERMS,
+    CREATE_PATH,
+    CROP_DEFAULTS,
+    CURRENT_HAIR_CLAUSE,
+    DEFAULT_MASK_RULE,
+    DENOISE_BAND,
+    EXPECTED_STYLE_ID,
+    FORBIDDEN_POSITIVE_PATTERN,
+    GLASSES_CLAUSE,
+    MASK_RULE_ID,
+    NECKLACE_CLAUSE,
+    NEGATIVE_PROMPT,
+    OUTPUTS_PATH,
+    PASS_DENOISE,
+    PROTECTED_CORE_ERODE_PX,
+    REQUIRED_NEGATIVE_TERMS,
+    SAMPLER,
+    STATUS_PATH,
+    TUNED_STYLE_ID,
+    UPLOAD_PATH,
+    RunningHubError,
+    _crop_box,
+    _mask_pipeline_np,
+    _post,
+    _read_key,
+    _workflow_diff,
+    build_prompts,
+    build_workflow,
+    collect_gate_checks,
+    create_task,
+    download,
+    extract_plan_targets,
+    fetch_outputs,
+    pick_image_output,
+    poll_task,
+    run_task,
+    task_status,
+    upload,
+    validate_checkpoint,
+    validate_workflow,
+)
 
-CHECKPOINT = "juggernautXL_juggXIByRundiffusion.safetensors"
+__all__ = [
+    "BASE_URL",
+    "CHECKPOINT",
+    "COLLAR_CLAUSE",
+    "COLLAR_NEGATIVE_TERMS",
+    "CREATE_PATH",
+    "CROP_DEFAULTS",
+    "CURRENT_HAIR_CLAUSE",
+    "DEFAULT_MASK_RULE",
+    "DENOISE_BAND",
+    "EXPECTED_STYLE_ID",
+    "FORBIDDEN_POSITIVE_PATTERN",
+    "GLASSES_CLAUSE",
+    "MASK_RULE_ID",
+    "NECKLACE_CLAUSE",
+    "NEGATIVE_PROMPT",
+    "OUTPUTS_PATH",
+    "PASS_DENOISE",
+    "PROTECTED_CORE_ERODE_PX",
+    "REQUIRED_NEGATIVE_TERMS",
+    "RunningHubError",
+    "SAMPLER",
+    "STATUS_PATH",
+    "TUNED_STYLE_ID",
+    "UPLOAD_PATH",
+    "_crop_box",
+    "_mask_pipeline_np",
+    "_post",
+    "_read_key",
+    "_workflow_diff",
+    "build_prompts",
+    "build_workflow",
+    "collect_gate_checks",
+    "create_task",
+    "download",
+    "extract_plan_targets",
+    "fetch_outputs",
+    "main",
+    "pick_image_output",
+    "poll_task",
+    "run_task",
+    "task_status",
+    "upload",
+    "validate_checkpoint",
+    "validate_workflow",
+]
 
-# The style this round must realise. The masks, the identity constraints and the
-# acceptance list were all built for this one plan; driving the run from any other
-# style (the previously wired ``artistic_wave`` approximation in particular) would
-# silently change what the picture is supposed to be.
-EXPECTED_STYLE_ID = "ai_elegant_refined"
-
-# The runtime has no dedicated inpainting checkpoint. Every ``CheckpointLoaderSimple``
-# option is a plain SD1.5/SDXL base or a Flux UNet, and the only inpaint weights on
-# the platform are ControlNet / LLLite patches that plug into a Qwen-Image or Flux
-# graph -- splicing one of those into this SDXL CropAndStitch graph is exactly the
-# incompatible-node assembly the brief forbids, so it is not attempted. What *is*
-# supported for a base SDXL model is the classic masked-latent path: VAE-encode the
-# crop, confine sampling with a ``noise_mask``, and stay below denoise 1.0 so the
-# existing pixels still drive the sampler. ``validate_checkpoint`` states this
-# verdict explicitly instead of pretending the concat-inpaint path is available.
-
-# Mask geometry decisions (see evidence/p29-fix-run/mask_pipeline_probe.py):
-#   * mask_fill_holes=False -- the node's iterative fill *added* 282 px of
-#     protected chin/collar skin to the clothing mask and 2 px to the hair mask,
-#     i.e. it repainted skin we promised to keep. The 283 px of speckle holes it
-#     was closing are far below one latent pixel (a 1024 px crop is a 128x128
-#     latent) and they fail *safe*: a hole keeps the original pixel.
-#   * mask_blend_pixels=2 -- expand(2)+blur(1) reaches ~4 px past the mask edge
-#     rather than ~8 px, and that ring is the only place a generated pixel can
-#     touch the protected identity contour. Not 0, because a hard edge would cut
-#     the hair/skin boundary the stitch has to feather.
-#   * mask_expand_pixels=0 -- the SCHP masks already cover the target silhouette.
-#   * context_from_mask_extend_factor=1.2 -- widens the crop the model sees, not
-#     the mask it is allowed to paint.
-CROP_DEFAULTS: dict[str, object] = {
-    "downscale_algorithm": "bilinear",
-    "upscale_algorithm": "bicubic",
-    "preresize": False,
-    "preresize_mode": "ensure minimum resolution",
-    "preresize_min_width": 1024,
-    "preresize_min_height": 1024,
-    "preresize_max_width": 16384,
-    "preresize_max_height": 16384,
-    "mask_fill_holes": False,
-    "mask_expand_pixels": 0,
-    "mask_invert": False,
-    "mask_blend_pixels": 2,
-    "mask_hipass_filter": 0.1,
-    "extend_for_outpainting": False,
-    "extend_up_factor": 1.0,
-    "extend_down_factor": 1.0,
-    "extend_left_factor": 1.0,
-    "extend_right_factor": 1.0,
-    "context_from_mask_extend_factor": 1.2,
-    "output_resize_to_target_size": True,
-    "output_target_width": 1024,
-    "output_target_height": 1024,
-    "output_padding": "32",
-    "device_mode": "gpu (much faster)",
+STAGED_INPUTS = {
+    "original": "original.jpg",
+    "clothing_mask": "clothing_edit_mask.png",
+    "hair_mask": "hair_edit_mask.png",
 }
-
-SAMPLER = {
-    "steps": 30,
-    "cfg": 6.5,
-    "sampler_name": "dpmpp_2m_sde",
-    "scheduler": "karras",
-}
-
-# Denoise is per pass. With ``noise_mask`` set, the sampler starts the masked
-# region from ``encode(original_crop) + noise * sigma(denoise)`` and blends the
-# unmasked region back to the clean latent after every step, so denoise is the
-# img2img strength *inside the mask only*. Because the runtime has no inpainting
-# checkpoint, this strength is the only handle on "keep the person, change the
-# garment": denoise=1.0 discards the original signal and was the direct cause of
-# the duplicated head. The band is the range in which the model still has to
-# follow the silhouette that is already there.
-PASS_DENOISE = {"clothing": 0.75, "hair": 0.70}
-DENOISE_BAND = (0.60, 0.80)
-
-# The plan's Accessories clause asks for new browline glasses, but this round's
-# acceptance list pins "glasses unchanged" and the glasses sit inside the
-# protected identity mask, so the clause is dropped from the prompt instead of
-# contradicting the identity constraints in the same conditioning.
-GLASSES_CLAUSE = "replace the current round thin metal-frame glasses"
-
-# The garment clause ends with a new necklace, which is an accessory the masks do
-# not cover, so it is dropped the same way.
-NECKLACE_CLAUSE = "worn with a slim metal necklace"
-
-# The plan names a *shirt*, and a shirt alone left the sampler free to open the
-# neckline: both billed runs came back with a deep V and an exposed chest, which
-# the plan's own silhouette explicitly forbids. The neckline is therefore pinned
-# on the positive side as well -- a higher natural collar closed near the
-# collarbone, with the vintage folds the plan asks for -- so "follow the existing
-# garment" does not read as "open the front".
-# The second billed run closed the neckline but did not recolour it: both the
-# Clothing Pass and the FINAL kept ~10.5k px of the *old* off-white knit at
-# the neck -- a pale vertical strip and a pale patch under the jaw, present in
-# the Clothing Pass itself and therefore not a hair-pass artefact. The clause is
-# now pinned on the colour side as well, so "a higher collar" cannot be read as
-# "keep whatever light fabric already sits there".
-COLLAR_CLAUSE = (
-    "a higher natural collar closed near the collarbone, cut from the same deep "
-    "olive-green cloth as the blouse, its inner lining and its folds all in that "
-    "same deep olive-green tone, with fine pleats and soft vintage folds"
-)
-
-# The neckline artefacts the plan rules out, carried as negative terms so the
-# sampler is pushed away from an open front even where the mask leaves the
-# neckline editable. These are hints only: the mask and the original-crop
-# conditioning are what actually hold the silhouette.
-COLLAR_NEGATIVE_TERMS = (
-    "deep v neck",
-    "plunging neckline",
-    "exposed chest",
-    "bare cleavage",
-    "sheer mesh shoulder",
-    "statement necklace",
-    # The garment being replaced is an off-white textured knit, so every term
-    # above still left the sampler free to keep a light layer at the neck. These
-    # rule out a second, lighter layer -- a white/beige collar lining, a scarf or
-    # an inner top -- which is what the last run printed as the pale residual.
-    "white collar",
-    "cream collar",
-    "beige collar lining",
-    "white inner layer",
-    "pale knit at the neckline",
-    "white scarf",
-    "beige knitted scarf",
-    "white undershirt",
-    "ivory lining",
-)
-
-# ``hair_prompt`` names the hair being replaced. At denoise below 1.0 a
-# description of the input biases the model toward keeping it, so only the
-# target colour is kept.
-CURRENT_HAIR_CLAUSE = "from the current deep black / dark brown"
-
-# The plan clause is split at the verb that introduces the target, so the positive
-# prompt is still the plan's own wording -- just without the "here is what the
-# person currently looks like" preamble that made the model redraw the person.
-CLOTHING_TARGET_MARKER = "Replace it with"
-HAIR_TARGET_MARKER = "Change it into"
-CLOTHING_TARGET_SUFFIX = (
-    "draped naturally over the body, following the original pose and body shape, "
-    "with natural cloth folds"
-)
-HAIR_TARGET_SUFFIX = (
-    "real individual hair strands, natural hairline, growing naturally from the "
-    "existing scalp"
-)
-
-# Positive prompts may describe only what is inside the mask. Spelled-out facial
-# features are the one thing a masked edit must never ask for: the crop already
-# contains a whole head as context, and "keep the facial features exactly" reads
-# as an instruction to draw them. Matched on word boundaries so "chestnut brown"
-# is not mistaken for "brow".
-FORBIDDEN_POSITIVE_PATTERN = re.compile(
-    r"\b(facial feature|facial features|eye|eyes|eyebrow|eyebrows|brow|brows|"
-    r"nose|lips|lip|mouth|teeth|smile|face|glasses|person|portrait|identity)\b",
-    re.IGNORECASE,
-)
-
-# English rendering of prompt_bundle.negative_prompt (which is Chinese; CLIP for
-# SDXL is English-trained). The first eight terms are the artefacts the previous
-# run actually produced -- a second face with its own glasses and mouth, and
-# patchy hair -- and the rest carry the identity / background / seam rules. The
-# negative prompt is a hint only: the mask and the original-pixel conditioning
-# are what actually hold the identity.
-NEGATIVE_PROMPT = (
-    "duplicate face, extra eyes, extra mouth, extra glasses, double head, "
-    "second person, bald patches, deformed hairline, "
-    "plastic airbrushed skin, blurred face, reshaped or replaced facial features, "
-    "a different person's face, obvious age drift, changing the number of people, "
-    "a broken or damaged background, extra fingers or limbs, text, watermark, "
-    "visible seam, hard cut-out edge"
-)
-REQUIRED_NEGATIVE_TERMS = (
-    "duplicate face",
-    "extra eyes",
-    "extra mouth",
-    "extra glasses",
-    "double head",
-    "second person",
-    "bald patches",
-    "deformed hairline",
-)
-
-# The plan writes each clause as "here is the current state ... <verb> <target>".
-# At denoise below 1.0 the "current state" half is a description of the input,
-# which biases the sampler toward keeping it -- and, worse, it is a description
-# of the person, which is exactly what made the model draw one. Only the half
-# after the verb is used, re-introduced with a neutral sentence frame.
-TARGET_INTRO = {"clothing": "Replace the garment with ", "hair": "Replace the hairstyle with "}
-
-# The plan's own identity rule, kept verbatim as the single mask instruction. The
-# rest of ``identity_constraints.prompt_text_en`` describes facial features and is
-# deliberately NOT sent: with a whole head inside the crop, "keep the facial
-# features exactly" reads as an instruction to draw them.
-MASK_RULE_ID = "edit_only_inside_masks"
-
-
-def _plan_mask_rule(bundle: dict) -> str:
-    for rule in bundle.get("identity_constraints", {}).get("rules", []):
-        if rule.get("id") == MASK_RULE_ID and rule.get("en"):
-            return rule["en"]
-    raise SystemExit(f"prompt bundle has no {MASK_RULE_ID!r} identity rule")
-
-
-def _tidy(text: str) -> str:
-    """Collapse whitespace and remove the space the clause removal left before punctuation."""
-    return re.sub(r"\s+", " ", re.sub(r"\s+([.,])", r"\1", text)).strip()
-
-
-def _join_head_tail(head: str, tail: str) -> str:
-    if head.rstrip().endswith((",", ".", ";", ":")):
-        head = head.rstrip()[:-1] + " "
-    return _tidy(head + tail)
-
-
-def _drop_clause(text: str, clause: str) -> tuple[str, bool]:
-    """Remove ``clause`` and the punctuation/space that glued it to the sentence."""
-    idx = text.find(clause)
-    if idx < 0:
-        return text, False
-    head, tail = text[:idx], text[idx + len(clause):]
-    return _join_head_tail(head, tail), True
-
-
-def _drop_clause_through(text: str, clause: str) -> tuple[str, bool]:
-    """Remove ``clause`` *and the rest of the sentence it opens*.
-
-    Used for plan clauses whose tail is a comma-separated descriptor list. The
-    plan's glasses clause is ``replace the current round thin metal-frame glasses
-    with 半框眉线眼镜 (browline / clubmaster eyeglasses): ... sitting naturally on
-    the face.`` -- dropping only the lead marker would leave ``brow`` and
-    ``face`` in a positive prompt whose whole point is that facial features are
-    not to be described.
-    """
-    idx = text.find(clause)
-    if idx < 0:
-        return text, False
-    tail = text[idx + len(clause):]
-    end = re.search(r"\.(?=\s|$)", tail)
-    tail = tail[end.end():] if end else ""
-    return _join_head_tail(text[:idx], tail), True
-
-
-def _target_half(text: str, marker: str, kind: str) -> str:
-    """Keep only the clause after ``marker`` and give it a neutral sentence frame."""
-    idx = text.find(marker)
-    if idx < 0:
-        raise SystemExit(f"{kind}: plan prompt has no {marker!r} marker")
-    rest = text[idx + len(marker):].strip()
-    rest = re.sub(r"\s+", " ", rest)
-    frame = TARGET_INTRO[kind]
-    return frame + rest[0].lower() + rest[1:] if rest else frame.strip()
-
-
-def _read_key(key_file: Path) -> str:
-    key = key_file.read_text().strip()
-    if len(key) < 16:
-        raise SystemExit(f"credential file {key_file} does not look like an API key")
-    return key
-
-
-def build_prompts(bundle: dict) -> dict:
-    """Turn the stored plan into the two positive prompts and the shared negative.
-
-    Everything is taken from the plan text; the only edits are the ones the mask
-    scope demands (drop the accessory clauses whose target sits outside the mask)
-    and the ones identity preservation demands (drop the "who the person is"
-    preamble, which the first run's model answered by drawing a second person).
-    """
-    style_id = bundle.get("style_id")
-    if style_id != EXPECTED_STYLE_ID:
-        raise SystemExit(f"prompt bundle style_id is {style_id!r}, expected {EXPECTED_STYLE_ID!r}")
-
-    clothing = _target_half(bundle["clothing_prompt"], CLOTHING_TARGET_MARKER, "clothing")
-    clothing, necklace_dropped = _drop_clause(clothing, NECKLACE_CLAUSE)
-    clothing, glasses_dropped = _drop_clause_through(clothing, GLASSES_CLAUSE)
-    clothing = (
-        f"{clothing.rstrip(' .,;')}, {CLOTHING_TARGET_SUFFIX}, {COLLAR_CLAUSE}"
-    )
-
-    hair = _target_half(bundle["hair_prompt"], HAIR_TARGET_MARKER, "hair")
-    hair, current_hair_dropped = _drop_clause(hair, CURRENT_HAIR_CLAUSE)
-    hair = f"{hair.rstrip(' .,;')}, {HAIR_TARGET_SUFFIX}"
-
-    negative = f"{NEGATIVE_PROMPT}, {', '.join(COLLAR_NEGATIVE_TERMS)}"
-    rule = _plan_mask_rule(bundle)
-    prompts = {
-        "style_id": style_id,
-        "style_name": bundle.get("style_name"),
-        "clothing": f"{clothing} {rule}",
-        "hair": f"{hair} {rule}",
-        "negative": negative,
-        "glasses_clause_dropped": glasses_dropped,
-        "necklace_clause_dropped": necklace_dropped,
-        "current_hair_clause_dropped": current_hair_dropped,
-        "collar_clause": COLLAR_CLAUSE,
-        "mask_rule": rule,
-    }
-
-    for key in ("clothing", "hair"):
-        hit = FORBIDDEN_POSITIVE_PATTERN.search(prompts[key])
-        if hit:
-            raise SystemExit(
-                f"{key} positive prompt names a facial feature or a person: {hit.group(0)!r} "
-                f"in {prompts[key]!r}"
-            )
-    missing = [term for term in REQUIRED_NEGATIVE_TERMS if term not in prompts["negative"]]
-    if missing:
-        raise SystemExit(f"negative prompt is missing {missing}")
-    missing_collar = [term for term in COLLAR_NEGATIVE_TERMS if term not in prompts["negative"]]
-    if missing_collar:
-        raise SystemExit(f"negative prompt is missing the neckline terms {missing_collar}")
-    if COLLAR_CLAUSE not in prompts["clothing"]:
-        raise SystemExit("clothing prompt lost the closed-collar clause")
-    for kind in ("clothing", "hair"):
-        denoise = PASS_DENOISE[kind]
-        if not DENOISE_BAND[0] <= denoise <= DENOISE_BAND[1]:
-            raise SystemExit(f"{kind} denoise {denoise} outside {DENOISE_BAND}")
-    return prompts
-
-
-def build_workflow(package: Path, filenames: dict[str, str], prompts: dict, seed: int) -> dict:
-    hair_mask = filenames["hair_mask"]
-    clothing_mask = filenames["clothing_mask"]
-    original = filenames["original"]
-    crop = CROP_DEFAULTS
-
-    return {
-        "1": {"class_type": "LoadImage", "inputs": {"image": original}},
-        "2": {"class_type": "LoadImageMask", "inputs": {"image": clothing_mask, "channel": "red"}},
-        "3": {
-            "class_type": "CheckpointLoaderSimple",
-            "inputs": {"ckpt_name": CHECKPOINT},
-        },
-        "4": {
-            "class_type": "InpaintCropImproved",
-            "inputs": {"image": ["1", 0], "mask": ["2", 0], **crop},
-        },
-        "5": {
-            "class_type": "CLIPTextEncode",
-            "inputs": {"text": prompts["clothing"], "clip": ["3", 1]},
-        },
-        "6": {
-            "class_type": "CLIPTextEncode",
-            "inputs": {"text": prompts["negative"], "clip": ["3", 1]},
-        },
-        # The crop's own pixels and the crop's own mask go into the conditioning.
-        # ``InpaintModelConditioning`` returns a latent whose samples are the VAE
-        # encoding of the *original* crop (not of a grey fill) plus a ``noise_mask``
-        # built from the crop mask, and it is that latent -- reached through this
-        # node's three outputs -- that the sampler must start from.
-        "7": {
-            "class_type": "InpaintModelConditioning",
-            "inputs": {
-                "positive": ["5", 0],
-                "negative": ["6", 0],
-                "vae": ["3", 2],
-                "pixels": ["4", 1],
-                "mask": ["4", 2],
-                "noise_mask": True,
-            },
-        },
-        "8": {
-            "class_type": "KSampler",
-            "inputs": {
-                "model": ["3", 0],
-                "seed": seed,
-                "positive": ["7", 0],
-                "negative": ["7", 1],
-                "latent_image": ["7", 2],
-                **SAMPLER,
-                "denoise": PASS_DENOISE["clothing"],
-            },
-        },
-        "9": {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["3", 2]}},
-        "10": {
-            "class_type": "InpaintStitchImproved",
-            "inputs": {"stitcher": ["4", 0], "inpainted_image": ["9", 0]},
-        },
-        "11": {"class_type": "LoadImageMask", "inputs": {"image": hair_mask, "channel": "red"}},
-        "12": {
-            "class_type": "InpaintCropImproved",
-            "inputs": {"image": ["10", 0], "mask": ["11", 0], **crop},
-        },
-        "13": {
-            "class_type": "CLIPTextEncode",
-            "inputs": {"text": prompts["hair"], "clip": ["3", 1]},
-        },
-        "14": {
-            "class_type": "CLIPTextEncode",
-            "inputs": {"text": prompts["negative"], "clip": ["3", 1]},
-        },
-        "15": {
-            "class_type": "InpaintModelConditioning",
-            "inputs": {
-                "positive": ["13", 0],
-                "negative": ["14", 0],
-                "vae": ["3", 2],
-                "pixels": ["12", 1],
-                "mask": ["12", 2],
-                "noise_mask": True,
-            },
-        },
-        "16": {
-            "class_type": "KSampler",
-            "inputs": {
-                "model": ["3", 0],
-                "seed": seed + 1,
-                "positive": ["15", 0],
-                "negative": ["15", 1],
-                "latent_image": ["15", 2],
-                **SAMPLER,
-                "denoise": PASS_DENOISE["hair"],
-            },
-        },
-        "17": {"class_type": "VAEDecode", "inputs": {"samples": ["16", 0], "vae": ["3", 2]}},
-        "18": {
-            "class_type": "InpaintStitchImproved",
-            "inputs": {"stitcher": ["12", 0], "inpainted_image": ["17", 0]},
-        },
-        "19": {"class_type": "SaveImage", "inputs": {"images": ["18", 0], "filename_prefix": "p29_elegant"}},
-        # Stage record for the two-pass replay. Node 19 is the finished frame;
-        # this second save is the clothing pass's own stitch, captured before the
-        # hair pass runs. Both hang off existing nodes, so the run still samples
-        # exactly twice -- nothing here creates an extra task or a second
-        # sampling pass, it only names which stage a pixel came from. Without it
-        # a pale band under the chin cannot be attributed to one pass or the
-        # other after the fact.
-        "20": {
-            "class_type": "SaveImage",
-            "inputs": {"images": ["10", 0], "filename_prefix": "p29_elegant_clothing_pass"},
-        },
-    }
-
-
-def _split_field(field):
-    """Normalise a ComfyUI INPUT_TYPES entry into (kind, opts).
-
-    ``field`` is either a bare type name, ``[type_name, opts]``, a combo
-    ``[[option, ...]]`` or a combo with opts ``[[option, ...], opts]``.
-    """
-    if isinstance(field, list) and field:
-        kind = field[0]
-        opts = field[1] if len(field) > 1 and isinstance(field[1], dict) else {}
-        return kind, opts
-    return field, {}
-
-
-def validate_workflow(workflow: dict, object_info: dict | None) -> list[str]:
-    """Mimic ComfyUI prompt validation so a bad graph never reaches the platform."""
-    errors: list[str] = []
-    ids = set(workflow)
-    slot_count: dict[str, int] = {}
-
-    for node_id, node in workflow.items():
-        spec = (object_info or {}).get(node["class_type"])
-        if object_info is not None and spec is None:
-            errors.append(f"node {node_id}: class_type {node['class_type']!r} is not installed")
-            continue
-        slot_count[node_id] = len(spec["output"]) if spec else 3
-
-    for node_id, node in workflow.items():
-        spec = (object_info or {}).get(node["class_type"])
-        declared = {}
-        if spec:
-            declared = {**spec["input"].get("required", {}), **spec["input"].get("optional", {})}
-        for name, value in node["inputs"].items():
-            is_link = isinstance(value, list) and len(value) == 2 and isinstance(value[0], str)
-            if is_link:
-                target, slot = value
-                if target not in ids:
-                    errors.append(f"node {node_id}.{name}: links to missing node {target!r}")
-                elif slot >= slot_count.get(target, 0):
-                    errors.append(
-                        f"node {node_id}.{name}: node {target} has no output slot {slot} "
-                        f"(has {slot_count.get(target)})"
-                    )
-                continue
-            field = declared.get(name)
-            if field is None:
-                if spec is not None:
-                    errors.append(f"node {node_id}.{name}: unknown input for {node['class_type']}")
-                continue
-            kind, opts = _split_field(field)
-            if isinstance(kind, list):  # COMBO
-                # image_upload inputs hold a server-side filename, not a bundled
-                # example, so any non-empty name is accepted.
-                if opts.get("image_upload") and isinstance(value, str) and value:
-                    continue
-                if value not in kind:
-                    errors.append(f"node {node_id}.{name}: {value!r} not in allowed options")
-            elif kind == "INT" and not isinstance(value, int):
-                errors.append(f"node {node_id}.{name}: expected int, got {value!r}")
-            elif kind == "FLOAT" and not isinstance(value, (int, float)):
-                errors.append(f"node {node_id}.{name}: expected float, got {value!r}")
-            elif kind == "STRING" and not isinstance(value, str):
-                errors.append(f"node {node_id}.{name}: expected string, got {value!r}")
-            elif kind in {"INT", "FLOAT"} and "min" in opts and value < opts["min"]:
-                errors.append(f"node {node_id}.{name}: {value} below min {opts['min']}")
-            elif kind in {"INT", "FLOAT"} and "max" in opts and value > opts["max"]:
-                errors.append(f"node {node_id}.{name}: {value} above max {opts['max']}")
-
-        if spec is None:
-            continue
-        provided = set(node["inputs"])
-        for name in spec["input"].get("required", {}):
-            if name not in provided:
-                errors.append(f"node {node_id}.{name}: missing required input")
-    return errors
-
-
-# ---------------------------------------------------------------------------
-# Pre-flight gate. Nothing below this line talks to the network; every check is
-# local so a graph that would burn a paid run on a broken assumption is stopped
-# here. The checks deliberately re-derive the *geometry* the runtime will use
-# (mask processing, crop box, resize) instead of trusting the workflow JSON.
-# ---------------------------------------------------------------------------
-
-PROTECTED_CORE_ERODE_PX = 8
-
-
-def _mask_pipeline_np(mask, blend_pixels: int, expand_pixels: int, fill_holes: bool):
-    """Port of InpaintCropImproved's mask prep: hipass -> [fill] -> expand -> blur.
-
-    Kept in numpy (the runtime is torch) so the geometry can be recomputed offline;
-    ``evidence/p29-fix-run/mask_pipeline_probe.py`` checks this port against the
-    real node source line by line.
-    """
-    import numpy as np
-    from scipy import ndimage
-
-    out = mask.copy()
-    out[out < CROP_DEFAULTS["mask_hipass_filter"]] = 0
-    if fill_holes:
-        for threshold in (1, 0.99, 0.97, 0.95, 0.93, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1):
-            closed = ndimage.binary_closing(out >= threshold, structure=np.ones((3, 3)), border_value=1)
-            filled = ndimage.binary_fill_holes(closed)
-            out = np.maximum(out, np.where(filled != 0, threshold, 0))
-    for pixels in (expand_pixels, blend_pixels):
-        if pixels > 0:
-            sigma = pixels / 4
-            size = int(np.ceil(sigma * 1.5 + 1))
-            out = np.clip(ndimage.grey_dilation(out, size=(size, size)), 0, 1)
-    if blend_pixels > 0:
-        out = np.clip(ndimage.gaussian_filter(out, sigma=blend_pixels * 0.5), 0, 1)
-    return out
-
-
-def _crop_box(mask, target_w: int, target_h: int, padding: int, factor: float, width: int, height: int):
-    """Port of findcontextarea -> growcontextarea -> crop_magic_im's aspect fit."""
-    import numpy as np
-
-    ys, xs = np.nonzero(mask)
-    bx, by = int(xs.min()), int(ys.min())
-    bw, bh = int(xs.max() - bx + 1), int(ys.max() - by + 1)
-    gx, gy = round(bw * (factor - 1.0) / 2.0), round(bh * (factor - 1.0) / 2.0)
-    bx, by = max(0, bx - gx), max(0, by - gy)
-    bw = min(width, bx + bw + 2 * gx) - bx
-    bh = min(height, by + bh + 2 * gy) - by
-    target_w = -(-target_w // padding) * padding
-    target_h = -(-target_h // padding) * padding
-    aspect = target_w / target_h
-    if bw / bh < aspect:
-        bw = int(bh * aspect)
-    else:
-        bh = int(bw / aspect)
-    return dict(x=bx, y=by, w=bw, h=bh, target_w=target_w, target_h=target_h)
-
-
-def _workflow_diff(before: dict, after: dict) -> list[str]:
-    """Node-level diff of two API-format graphs, for the report's evidence trail."""
-    lines: list[str] = []
-    for node_id in sorted(set(before) | set(after), key=int):
-        old, new = before.get(node_id), after.get(node_id)
-        if old is None:
-            lines.append(f"+ node {node_id} {new['class_type']}")
-            continue
-        if new is None:
-            lines.append(f"- node {node_id} {old['class_type']}")
-            continue
-        if old["class_type"] != new["class_type"]:
-            lines.append(f"~ node {node_id} {old['class_type']} -> {new['class_type']}")
-            continue
-        changed = [
-            f"{key}: {old['inputs'].get(key)!r} -> {value!r}"
-            for key, value in new["inputs"].items()
-            if old["inputs"].get(key) != value
-        ]
-        changed += [f"{key}: {old['inputs'][key]!r} -> (removed)"
-                    for key in old["inputs"] if key not in new["inputs"]]
-        if changed:
-            lines.append(f"~ node {node_id} {new['class_type']}: " + "; ".join(changed))
-    return lines
-
-
-def validate_checkpoint(object_info: dict | None) -> list[str]:
-    """Report what the runtime can actually do with this checkpoint.
-
-    The platform's whole checkpoint list is SD1.5 / SDXL base and Flux UNets -- no
-    inpainting UNet, and the only inpaint weights are ControlNet / LLLite patches
-    for Qwen-Image and Flux. A base SDXL model has no 9-channel inpainting input,
-    so ``InpaintModelConditioning``'s ``concat_latent_image`` / ``concat_mask`` are
-    ignored and the only thing that survives is its ``noise_mask`` plus the encoded
-    original crop. That is a real, supported path -- google's mask-latent inpainting
-    -- and it is what this workflow is built on; the verdict is printed so nobody
-    later reads the graph as "concat inpainting that silently did nothing".
-    """
-    notes = [f"checkpoint {CHECKPOINT} has no inpainting UNet input; the run uses the "
-             f"masked-latent path (InpaintModelConditioning noise_mask + encoded original crop)"]
-    if object_info is None:
-        notes.append("WARNING: no object_info, checkpoint existence not confirmed")
-        return notes
-    spec = object_info.get("CheckpointLoaderSimple")
-    options = ((spec or {}).get("input", {}).get("required", {}).get("ckpt_name") or [[]])[0]
-    if CHECKPOINT not in options:
-        notes.append(f"ERROR: {CHECKPOINT} is not offered by the runtime")
-    if any("inpaint" in name.lower() for name in options):
-        notes.append("NOTE: the runtime lists an inpainting checkpoint; a future run may "
-                     "prefer it and can then use the concat path")
-    return notes
-
-
-def collect_gate_checks(workflow: dict, object_info: dict | None, prompts: dict, bundle: dict,
-                        package: Path) -> tuple[list[str], dict]:
-    """Every check that must pass before a billed task is created."""
-    import numpy as np
-    from PIL import Image
-
-    errors: list[str] = []
-    report: dict = {
-        "style_id": prompts["style_id"],
-        "style_name": prompts.get("style_name"),
-        "checkpoint": CHECKPOINT,
-        "denoise": dict(PASS_DENOISE),
-        "crop": {k: CROP_DEFAULTS[k] for k in
-                 ("mask_fill_holes", "mask_expand_pixels", "mask_blend_pixels",
-                  "context_from_mask_extend_factor", "output_target_width", "output_target_height")},
-        "prompts": {k: prompts[k] for k in ("clothing", "hair", "negative")},
-        "style_id_matches_plan": prompts["style_id"] == EXPECTED_STYLE_ID,
-    }
-
-    # 1. no plain text-to-image anywhere: an empty latent would ignore the photo.
-    for node_id, node in workflow.items():
-        if node["class_type"] in {"EmptyLatentImage", "EmptySD3LatentImage", "VAEEncodeForInpaint"}:
-            errors.append(f"node {node_id}: {node['class_type']} must not appear in a masked edit")
-
-    passes = {"clothing": ("8", "7", "4"), "hair": ("16", "15", "12")}
-    for kind, (sampler_id, cond_id, crop_id) in passes.items():
-        sampler, cond = workflow[sampler_id], workflow[cond_id]
-        if cond["class_type"] != "InpaintModelConditioning":
-            errors.append(f"{kind}: node {cond_id} is {cond['class_type']}, expected InpaintModelConditioning")
-            continue
-        if sampler["inputs"]["latent_image"] != [cond_id, 2]:
-            errors.append(f"{kind}: sampler {sampler_id} latent is not {cond_id}'s latent output")
-        if sampler["inputs"]["positive"] != [cond_id, 0] or sampler["inputs"]["negative"] != [cond_id, 1]:
-            errors.append(f"{kind}: sampler {sampler_id} conditioning is not {cond_id}'s outputs")
-        if cond["inputs"]["pixels"] != [crop_id, 1] or cond["inputs"]["mask"] != [crop_id, 2]:
-            errors.append(f"{kind}: {cond_id} is not conditioned on crop node {crop_id}'s image/mask")
-        if cond["inputs"]["noise_mask"] is not True:
-            errors.append(f"{kind}: noise_mask must be enabled or the mask is not enforced")
-        denoise = sampler["inputs"].get("denoise")
-        if denoise is None or denoise >= 1.0:
-            errors.append(f"{kind}: denoise {denoise} would discard the original crop pixels")
-        elif not DENOISE_BAND[0] <= denoise <= DENOISE_BAND[1]:
-            errors.append(f"{kind}: denoise {denoise} outside {DENOISE_BAND}")
-        if workflow[sampler_id]["inputs"]["model"] != ["3", 0]:
-            errors.append(f"{kind}: sampler is not driven by the loaded checkpoint")
-
-    if workflow["10"]["inputs"]["stitcher"] != ["4", 0] or workflow["4"]["inputs"]["image"] != ["1", 0]:
-        errors.append("clothing pass does not start from the original photo")
-    if workflow["12"]["inputs"]["image"] != ["10", 0]:
-        errors.append("hair pass does not start from the clothing pass's stitched output")
-
-    # The two stage records. A SaveImage per pass is how a failed run can be
-    # attributed to the clothing pass or the hair pass afterwards; both must hang
-    # off existing nodes so the diagnostic adds no sampling.
-    saves = {nid: node for nid, node in workflow.items() if node["class_type"] == "SaveImage"}
-    report["stage_records"] = {
-        "save_nodes": sorted(saves),
-        "clothing_pass": [nid for nid, n in saves.items() if n["inputs"]["images"] == ["10", 0]],
-        "final": [nid for nid, n in saves.items() if n["inputs"]["images"] == ["18", 0]],
-    }
-    if not report["stage_records"]["clothing_pass"]:
-        errors.append("no SaveImage captures the clothing pass before the hair pass runs")
-    if not report["stage_records"]["final"]:
-        errors.append("no SaveImage captures the final hair pass")
-    extra_saves = set(saves) - set(report["stage_records"]["clothing_pass"]) - set(
-        report["stage_records"]["final"]
-    )
-    if extra_saves:
-        errors.append(f"unexpected SaveImage nodes {sorted(extra_saves)}")
-
-    ckpt = validate_checkpoint(object_info)
-    report["checkpoint_notes"] = ckpt
-    errors.extend(n for n in ckpt if n.startswith("ERROR"))
-
-    # 2. the plan's own wording has to survive into the prompts.
-    for kind, phrase in (("clothing", "深橄榄绿法式复古衬衫"), ("hair", "栗子棕")):
-        if phrase not in prompts[kind]:
-            errors.append(f"{kind} prompt lost the plan phrase {phrase!r}")
-    report["prompt_has_plan_phrases"] = all(
-        phrase in prompts[kind]
-        for kind, phrase in (("clothing", "深橄榄绿法式复古衬衫"), ("hair", "栗子棕"))
-    )
-    report["negative_prompt_terms_ok"] = all(t in prompts["negative"] for t in REQUIRED_NEGATIVE_TERMS)
-    report["collar_clause_ok"] = COLLAR_CLAUSE in prompts["clothing"]
-    report["collar_negative_terms_ok"] = all(
-        term in prompts["negative"] for term in COLLAR_NEGATIVE_TERMS
-    )
-    if not report["collar_clause_ok"]:
-        errors.append("clothing prompt does not pin a closed, higher collar")
-    if not report["collar_negative_terms_ok"]:
-        errors.append("negative prompt does not rule out a deep V neckline")
-
-    # 3. files, sizes and coordinates.
-    source = json.loads((package / "manifest.json").read_text())["source_image"]
-    frame = (source["width"], source["height"])
-    sizes = {}
-    for name in ("original.jpg", "hair_edit_mask.png", "clothing_edit_mask.png", "protected_identity_mask.png"):
-        path = package / name
-        if not path.is_file():
-            errors.append(f"package is missing {name}")
-            continue
-        with Image.open(path) as image:
-            sizes[name] = image.size
-        if sizes[name] != frame:
-            errors.append(f"{name} is {sizes[name]}, source photo is {frame}")
-    report["image_sizes"] = sizes
-
-    # 4. mask geometry as the node will actually build it.
-    if len(sizes) == 4:
-        load = lambda n: (np.array(Image.open(package / n).convert("L")) > 127).astype(np.float32)
-        hair_raw, clothing_raw = load("hair_edit_mask.png"), load("clothing_edit_mask.png")
-        protected = load("protected_identity_mask.png") > 0.5
-        from scipy import ndimage
-        core = ndimage.binary_erosion(protected, iterations=PROTECTED_CORE_ERODE_PX)
-        geometry = {}
-        for kind, raw in (("hair", hair_raw), ("clothing", clothing_raw)):
-            prepared = _mask_pipeline_np(
-                raw,
-                blend_pixels=int(CROP_DEFAULTS["mask_blend_pixels"]),
-                expand_pixels=int(CROP_DEFAULTS["mask_expand_pixels"]),
-                fill_holes=bool(CROP_DEFAULTS["mask_fill_holes"]),
-            )
-            hard, rim = prepared > 0.5, prepared > 0.02
-            box = _crop_box(prepared, int(CROP_DEFAULTS["output_target_width"]),
-                            int(CROP_DEFAULTS["output_target_height"]), 32,
-                            float(CROP_DEFAULTS["context_from_mask_extend_factor"]), *frame)
-            geometry[kind] = {
-                "raw_pixels": int((raw > 0.5).sum()),
-                "painted_pixels": int(hard.sum()),
-                "soft_ring_pixels": int((rim & ~hard).sum()),
-                "painted_over_protected": int((hard & protected).sum()),
-                "painted_over_facial_core": int((hard & core).sum()),
-                "crop": box,
-                "scale_x": round(box["target_w"] / box["w"], 4),
-                "scale_y": round(box["target_h"] / box["h"], 4),
-            }
-            if int((hard & core).sum()):
-                errors.append(f"{kind}: the painted mask reaches the facial core "
-                              f"({int((hard & core).sum())} px inside protected-by-{PROTECTED_CORE_ERODE_PX}px)")
-            if abs(geometry[kind]["scale_x"] / geometry[kind]["scale_y"] - 1) > 0.01:
-                errors.append(f"{kind}: crop is rescaled non-uniformly "
-                              f"({geometry[kind]['scale_x']} x {geometry[kind]['scale_y']})")
-        report["mask_geometry"] = geometry
-
-    report["errors"] = errors
-    return errors, report
-
-
-def _post(client: httpx.Client, path: str, key: str, payload: dict) -> dict:
-    response = client.post(path, json=payload, headers={"Authorization": f"Bearer {key}"})
-    response.raise_for_status()
-    body = response.json()
-    if body.get("code") not in (0, None):
-        raise SystemExit(f"{path} -> code={body.get('code')} msg={body.get('msg')} data={body.get('data')}")
-    return body
-
-
-def upload(client: httpx.Client, key: str, path: Path) -> str:
-    with path.open("rb") as handle:
-        response = client.post(
-            UPLOAD_PATH,
-            data={"apiKey": key},
-            files={"file": (path.name, handle, "application/octet-stream")},
-        )
-    response.raise_for_status()
-    body = response.json()
-    data = body.get("data") or {}
-    name = data.get("fileName") or data.get("filename")
-    if body.get("code") not in (0, None) or not name:
-        raise SystemExit(f"upload {path.name} failed: code={body.get('code')} keys={sorted(data)}")
-    print(f"  uploaded {path.name} ({path.stat().st_size} B) -> {name}")
-    return name
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -894,17 +147,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"WARNING: clause {label!r} not found in the plan prompt; nothing dropped",
                   file=sys.stderr)
 
-    staged = {
-        "original": "original.jpg",
-        "clothing_mask": "clothing_edit_mask.png",
-        "hair_mask": "hair_edit_mask.png",
-    }
-    for name in staged.values():
+    for name in STAGED_INPUTS.values():
         if not (package / name).is_file():
             raise SystemExit(f"package is missing {name}")
 
     args.out.mkdir(parents=True, exist_ok=True)
-    workflow = build_workflow(package, {k: f"__UPLOAD__{k}" for k in staged}, prompts, args.seed)
+    workflow = build_workflow(package, {k: f"__UPLOAD__{k}" for k in STAGED_INPUTS}, prompts, args.seed)
 
     object_info = None
     if args.object_info.is_file():
@@ -954,7 +202,7 @@ def main(argv: list[str] | None = None) -> int:
     key = _read_key(args.key_file)
     client = httpx.Client(base_url=BASE_URL, timeout=60.0)
     print("uploading inputs")
-    filenames = {k: upload(client, key, package / v) for k, v in staged.items()}
+    filenames = {k: upload(client, key, package / v) for k, v in STAGED_INPUTS.items()}
     workflow = build_workflow(package, filenames, prompts, args.seed)
     errors = validate_workflow(workflow, object_info)
     if errors:
@@ -970,33 +218,25 @@ def main(argv: list[str] | None = None) -> int:
     if not args.i_understand_this_costs_money:
         raise SystemExit("--submit needs --i-understand-this-costs-money (this creates one billed task)")
 
-    payload = {
-        "apiKey": key,
-        "workflowId": args.workflow_id,
-        "workflow": json.dumps(workflow),
-        "nodeInfoList": [],
-        "instanceType": args.instance_type,
-    }
-    created = _post(client, CREATE_PATH, key, payload)
+    created = create_task(
+        client, key, workflow, workflow_id=args.workflow_id, instance_type=args.instance_type
+    )
     task_id = created["data"]["taskId"]
     print(f"task created: {task_id} status={created['data'].get('taskStatus')}")
     if created["data"].get("promptTips"):
         print(f"promptTips: {created['data']['promptTips']}")
     (args.out / "task.json").write_text(json.dumps({"taskId": task_id, "create": created}, indent=2))
 
-    deadline = time.time() + args.poll_seconds
-    status = "QUEUED"
-    while time.time() < deadline:
-        time.sleep(6)
-        status = _post(client, STATUS_PATH, key, {"apiKey": key, "taskId": task_id})["data"]
-        print(f"  {status}")
-        if status in {"SUCCESS", "FAILED"}:
-            break
+    status = poll_task(
+        client, key, task_id,
+        timeout_seconds=args.poll_seconds,
+        on_status=lambda s: print(f"  {s}"),
+    )
     if status != "SUCCESS":
         print(f"task did not succeed (status={status}); no result downloaded", file=sys.stderr)
         return 1
 
-    outputs = _post(client, OUTPUTS_PATH, key, {"apiKey": key, "taskId": task_id})["data"]
+    outputs = fetch_outputs(client, key, task_id)
     (args.out / "outputs.json").write_text(json.dumps(outputs, indent=2))
     for index, item in enumerate(outputs):
         url = item.get("fileUrl")
@@ -1004,7 +244,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
         suffix = Path(url.split("?")[0]).suffix or ".png"
         target = args.out / f"result_{index}{suffix}"
-        target.write_bytes(client.get(url).content)
+        target.write_bytes(download(client, url))
         print(f"  result -> {target} ({target.stat().st_size} B) consumeCoins={item.get('consumeCoins')}")
     return 0
 

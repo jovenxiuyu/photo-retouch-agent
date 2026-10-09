@@ -1,5 +1,6 @@
 from __future__ import annotations
 from datetime import datetime, timezone
+from pathlib import Path
 from uuid import uuid4
 
 from app.brains.base import PromptBrain
@@ -92,6 +93,8 @@ class RetouchService:
             job.face_lock = report.to_dict()
         if report is None or report.ok:
             job.status = "succeeded"
+            job.verification_level = "visual_pending"
+            job.stage = "done"
             if report is None:
                 job.output_image_ids = [output_image_id]
                 job.output_urls = [f"/data/outputs/{output_filename}"]
@@ -103,6 +106,8 @@ class RetouchService:
         else:
             # A styling render whose strict face lock failed is not a success.
             job.status = "failed"
+            job.verification_level = "visual_failed"
+            job.stage = "done"
             job.output_image_ids = []
             job.output_urls = []
             job.error_message = (
@@ -139,6 +144,7 @@ class RetouchService:
                 output_path,
             )
         else:
+            self._set_stage(job, "provider_running")
             await self.provider.edit_image(
                 source_path=source_path,
                 output_path=output_path,
@@ -148,6 +154,15 @@ class RetouchService:
             self._finish_job(
                 job, source_path, output_image_id, output_filename, output_path
             )
+
+    def _set_stage(self, job: RetouchJob, stage: str) -> None:
+        """Record the current step (best effort: a write failure must not fail a job)."""
+        job.stage = stage
+        job.updated_at = datetime.now(timezone.utc)
+        try:
+            self.jobs.save(job)
+        except Exception:  # pragma: no cover - progress is advisory
+            pass
 
     async def _render_native_mask(
         self,
@@ -169,6 +184,8 @@ class RetouchService:
         # Record the intent up front so a failed build still leaves a trace of
         # which mask file the run was supposed to use.
         job.native_mask = record
+        job.verification_level = None
+        self._set_stage(job, "mask_build")
 
         build = self.native_mask.build_mask(source_path, mask_path)
         record["mask"] = build.to_dict()
@@ -177,15 +194,36 @@ class RetouchService:
         # composited back by ``finalise`` once the raw output verifies.
         raw_filename = f"raw_{output_image_id}{self.provider.output_extension}"
         raw_path = self.storage.config.outputs_dir / raw_filename
+        edit_kwargs: dict = {"mask_path": mask_path}
+        if getattr(self.provider, "accepts_mask_set", False):
+            edit_kwargs["mask_set"] = build.mask_set
+            edit_kwargs["mask_build"] = build
+            # The provider reports its own stage transitions from the worker
+            # thread; attach the reporter for this job only.
+            if hasattr(self.provider, "on_progress"):
+                self.provider.on_progress = lambda stage: self._set_stage(job, stage)
+        self._set_stage(job, "provider_preflight")
         await self.provider.edit_image(
             source_path=source_path,
             output_path=raw_path,
             plan=plan,
             user_instruction=job.user_instruction,
-            mask_path=mask_path,
+            **edit_kwargs,
         )
         record["rawPath"] = f"/data/outputs/{raw_filename}"
+        provider_task_id = getattr(self.provider, "last_task_id", None)
+        if provider_task_id:
+            record["providerTaskId"] = provider_task_id
+            job.provider_task_id = str(provider_task_id)
+        paid = int(getattr(self.provider, "paid_requests", 0) or 0)
+        if paid:
+            job.paid_requests = max(job.paid_requests, paid)
+            record["paidRequests"] = job.paid_requests
+        clothing_pass = getattr(self.provider, "last_clothing_pass_path", None)
+        if clothing_pass:
+            record["clothingPassPath"] = f"/data/outputs/{Path(clothing_pass).name}"
 
+        self._set_stage(job, "verification")
         verification = self.native_mask.finalise(
             source_path, raw_path, mask_path, output_path, mask_set=build.mask_set
         )
@@ -194,6 +232,10 @@ class RetouchService:
 
         if verification.ok:
             job.status = "succeeded"
+            # Machine checks passed; a human still has to accept the repainted
+            # region, so the published result is never called visually verified.
+            job.verification_level = "visual_pending"
+            job.stage = "done"
             job.output_image_ids = [output_image_id]
             job.output_urls = [f"/data/outputs/{output_filename}"]
             job.error_message = None
@@ -201,6 +243,8 @@ class RetouchService:
             # The kept pixels did not prove themselves the original's: the raw
             # repaint is *not* published and no success status is written.
             job.status = "failed"
+            job.verification_level = "visual_failed"
+            job.stage = "done"
             job.output_image_ids = []
             job.output_urls = []
             job.error_message = (
@@ -260,6 +304,8 @@ class RetouchService:
             await self._render(job, source_path, effective_plan)
         except Exception as exc:  # pragma: no cover - defensive status capture
             job.status = "failed"
+            job.stage = "done"
+            job.verification_level = "visual_failed"
             job.error_message = str(exc)
             job.updated_at = datetime.now(timezone.utc)
 
@@ -302,6 +348,8 @@ class RetouchService:
             await self._render(job, source_path, effective_plan)
         except Exception as exc:  # pragma: no cover - defensive status capture
             job.status = "failed"
+            job.stage = "done"
+            job.verification_level = "visual_failed"
             job.error_message = str(exc)
             job.updated_at = datetime.now(timezone.utc)
 

@@ -69,6 +69,10 @@ export function getJob(jobId) {
   return request(`/retouch/jobs/${jobId}`);
 }
 
+export function listJobs(limit = 20, offset = 0) {
+  return request(`/retouch/jobs?limit=${limit}&offset=${offset}`);
+}
+
 function modelHeaders(brain = {}, action = {}) {
   const headers = { "Content-Type": "application/json" };
   if (brain.name) headers["X-Agent-Provider"] = brain.name;
