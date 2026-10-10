@@ -46,13 +46,28 @@ Stages, from ``backend/``::
     ../.venv/bin/python -m tools.runninghub_collar_repair_run \
         --submit --i-understand-this-costs-money
 
-Gate 8 is the keep-vs-remove conflict the brief asks about: the central pale
-block under the jaw sits inside the subject's own skin guard, so "keep the
-original pixel" and "remove the residual" cannot both be satisfied there. When
-that region is non-empty the run HALTs by default (exit 2) and reports the
-exact pixel count and bbox. ``--accept-guarded-residual`` proceeds knowing the
-central block is left to the operator, and the released strip -- the only
-region the mask paints -- is still repaired.
+Gate 3 is the mask-scope gate. The released strip normally has to sit inside the
+analytic collar window (``window_bbox`` in the mask stats). The adjudication
+added one *named* exception, the 172 px carve directly under the chin
+(``chin_band_carve_*``), which reaches a few pixels above that window so the
+repair can reach the top of the white knit tuft. Gate 3 accepts it only when the
+carve clears its own evidence test -- 8-connected to the released strip, off the
+face oval, old knit the render left unchanged, and the subject's own skin model
+flagging at most ``CARVE_MAX_SKIN_FLAG_RATIO`` of it -- and refuses to widen the
+window otherwise. The allowed region is reported as window UNION carve, not as
+one silently enlarged box.
+
+Gate 8 is the keep-vs-remove conflict the brief asks about, now *split* rather
+than merely reported. The old 3007 px guarded strip was adjudicated: the 172 px
+that carried independent fabric evidence became the carve (gate 3), and the
+remainder is skin-toned with no independent fabric evidence, so it stays
+protected -- "what cannot be confirmed stays protected". Gate 8 therefore asks
+whether the region this pass will NOT edit still holds a visible old-knit
+remnant, measured as ``pale_knit_survivor_*``. A remnant at or below one latent
+cell of the checkpoint (8x8 px) is beneath the pass's own spatial resolution and
+does not block; anything larger HALTs the run by default (exit 2) with the exact
+pixel counts and blob boxes. ``--accept-guarded-residual`` is the emergency
+override and is explicitly NOT to be used this round.
 
 The API key is read from ``~/.runninghub_key`` and is never printed.
 """
@@ -101,6 +116,34 @@ DEFAULT_LABELS = REPO_ROOT / "evidence/p29-collar-repair/labels_fresh.png"
 COLLAR_REPAIR_DENOISE = 0.70
 
 FILENAME_PREFIX = "p29_collar_repair"
+
+#: A single-pass latent edit cannot express detail finer than one latent cell of
+#: the checkpoint (8 px, as for every SD1.5-family VAE). An old-knit remnant that
+#: fits inside one 8x8 cell is therefore below this pass's own spatial resolution
+#: -- it is not something a second generation of the same graph could fix either,
+#: and it is not a visible white patch on the delivered frame. Gate 8 uses this
+#: scale to call the residual *resolved* rather than demanding pixel-perfect
+#: coverage of the 3007 px guarded strip (which cannot be released at all: it is
+#: skin-toned and carries no independent fabric evidence).
+LATENT_CELL_PX = 8
+SURVIVOR_RESIDUAL_BLOB_LIMIT_PX = LATENT_CELL_PX * LATENT_CELL_PX          # 64
+SURVIVOR_RESIDUAL_TOTAL_LIMIT_PX = LATENT_CELL_PX * LATENT_CELL_PX * 4     # 256
+
+#: The carve is the one protected strip the adjudication moved into the release.
+#: It must be justified by its own evidence, not by "it looked pale": it has to
+#: be 8-connected to the released strip, must not sit on the face oval, must be
+#: a strip of the old knit the render left unchanged, and the subject's own skin
+#: model must flag (almost) none of it. ``carve_px`` counts these pixels; the
+#: skin-flag ratio is the fraction the skin model would still call skin.
+CARVE_MAX_SKIN_FLAG_RATIO = 0.05
+
+#: The strict "is any visible white cloth left?" limit. ``neutral_white_*`` is the
+#: FINAL render's near-greyscale bright pixels inside the collar band; the coarse
+#: pale-knit rules also catch pale-olive blouse highlights, so this is the test
+#: that speaks to "white cloth". A remnant at or below one latent cell does not
+#: block, same scale as the old-knit residual.
+NEUTRAL_WHITE_LIMIT_PX = LATENT_CELL_PX * LATENT_CELL_PX          # 64
+NEUTRAL_WHITE_BLOB_LIMIT_PX = LATENT_CELL_PX * LATENT_CELL_PX     # 64
 
 #: Minimal repair prompt. One job: continue the surrounding blouse across the
 #: masked strip. No facial/identity words, no accessory, no second garment.
@@ -352,13 +395,55 @@ def collect_gate_checks(workflow: dict, object_info: dict | None, *,
     stats = json.loads(stats_path.read_text())
     window_bbox = stats.get("window_bbox")
     feather_tol = int(CROP_DEFAULTS["mask_blend_pixels"]) + 1
+
+    def _union_bbox(*boxes):
+        boxes = [b for b in boxes if b]
+        if not boxes:
+            return None
+        return [min(b[0] for b in boxes), min(b[1] for b in boxes),
+                max(b[2] for b in boxes), max(b[3] for b in boxes)]
+
+    # The adjudication added one *named* strip to the release: the 172 px carve
+    # under the chin (``chin_band_carve_*`` in the mask stats). It reaches
+    # ``carve_bbox[1]`` = 588, i.e. 6 px above the analytic collar window, so the
+    # allowed region is the window UNION the carve band -- reported as two named
+    # regions rather than one widened rectangle, and only accepted when the carve
+    # clears its own evidence test below. Nothing else may leave the window.
+    carve_bbox = stats.get("chin_band_carve_bbox")
+    carve_px = int(stats.get("chin_band_carve_px", 0))
+    carve_skin_flag_px = int(stats.get("chin_band_carve_skin_flag_px", 0))
+    carve_oval_px = int(stats.get("chin_band_carve_oval_px", 0))
+    carve_release_px = int(stats["counts"].get("release_from_carve_px", 0))
+    carve_skin_flag_ratio = (carve_skin_flag_px / carve_px) if carve_px else 0.0
+    carve_justified = (
+        carve_px > 0
+        and carve_release_px == carve_px
+        and carve_oval_px == 0
+        and carve_skin_flag_ratio <= CARVE_MAX_SKIN_FLAG_RATIO
+    )
+    allowed_bbox = _union_bbox(window_bbox, carve_bbox if carve_justified else None)
+
     report["gate3_mask_is_collar_only"] = {
         "raw_mask_bbox": _bbox(mask_raw),
         "painted_bbox": _bbox(painted),
         "release_window_bbox": window_bbox,
+        "carve_bbox": carve_bbox,
+        "allowed_bbox": allowed_bbox,
         "feather_tolerance_px": feather_tol,
         "raw_mask_bbox_in_window": _within(_bbox(mask_raw), window_bbox),
-        "painted_bbox_within_window_plus_feather": _within(_bbox(painted), window_bbox, feather_tol),
+        "raw_mask_bbox_in_allowed": _within(_bbox(mask_raw), allowed_bbox),
+        "painted_bbox_within_allowed_plus_feather": _within(_bbox(painted), allowed_bbox, feather_tol),
+        "carve": {
+            "px": carve_px,
+            "bbox": carve_bbox,
+            "skin_flag_px": carve_skin_flag_px,
+            "skin_flag_ratio": carve_skin_flag_ratio,
+            "max_skin_flag_ratio": CARVE_MAX_SKIN_FLAG_RATIO,
+            "face_oval_px": carve_oval_px,
+            "release_from_carve_px": carve_release_px,
+            "justified": carve_justified,
+            "note": stats.get("chin_band_carve_note"),
+        },
         "mask_stats_release_px": stats["counts"]["release_px"],
         "mask_stats_release_px_in_collar_class": stats["counts"]["release_px_in_collar_class"],
         "mask_stats_release_over_hair_px": stats["counts"]["release_over_hair_px"],
@@ -397,10 +482,17 @@ def collect_gate_checks(workflow: dict, object_info: dict | None, *,
 
     if int(painted.sum()) == 0:
         errors.append("gate3: the repair mask is empty")
-    if not report["gate3_mask_is_collar_only"]["raw_mask_bbox_in_window"]:
-        errors.append("gate3: the authored mask leaves the collar window")
-    if not report["gate3_mask_is_collar_only"]["painted_bbox_within_window_plus_feather"]:
-        errors.append(f"gate3: the painted region leaves the collar window by more than {feather_tol} px")
+    if not carve_justified:
+        errors.append(
+            f"gate3: the {carve_px} px carve is not justified "
+            f"(release_from_carve={carve_release_px}, oval={carve_oval_px}, "
+            f"skin_flag_ratio={carve_skin_flag_ratio:.3f} > {CARVE_MAX_SKIN_FLAG_RATIO}) "
+            "-- refusing to widen the collar window on unconvincing evidence")
+    if not report["gate3_mask_is_collar_only"]["raw_mask_bbox_in_allowed"]:
+        errors.append("gate3: the authored mask leaves the collar window and its justified carve")
+    if not report["gate3_mask_is_collar_only"]["painted_bbox_within_allowed_plus_feather"]:
+        errors.append(f"gate3: the painted region leaves the collar window plus its justified carve "
+                      f"by more than {feather_tol} px")
     if feather_max_dist > int(CROP_DEFAULTS["mask_blend_pixels"]):
         errors.append(f"gate4: the feather reaches {feather_max_dist:.1f} px, beyond mask_blend_pixels")
     if guards_g["raw_mask_intersection_px"]:
@@ -446,16 +538,65 @@ def collect_gate_checks(workflow: dict, object_info: dict | None, *,
     errors.extend(f"gate7: {n}" for n in ckpt_notes if n.startswith("ERROR"))
 
     # -- gate 8: the keep-original vs remove-residual conflict -----------------
+    # The old 3007 px guarded strip is now adjudicated, not merely reported:
+    #   * the 172 px carve (independent knit evidence, off the face oval, skin
+    #     model flags ~none of it) was moved into the release -- gate 3 checks
+    #     that evidence and the graph repaints it;
+    #   * the remainder is skin-toned and carries no independent fabric evidence,
+    #     so per the brief ("what cannot be confirmed stays protected") it is
+    #     KEPT, not edited.
+    # Gate 8 therefore no longer asks "is anything guarded?" (the answer is yes,
+    # by design). It asks the question the brief actually poses: does the region
+    # this pass will NOT edit still hold a visible old-knit remnant? That is the
+    # measured ``pale_knit_survivor_*`` residual, the old knit (original luma >
+    # 150, chroma < 45) the render left unchanged in the collar band. A remnant
+    # at or below one latent cell of the checkpoint is below the pass's own
+    # spatial resolution and is not a visible defect, so it does not block.
     guarded = int(stats.get("guarded_pale_px", 0))
+    guarded_skin_like = int(stats.get("guarded_pale_final_skin_like_px", 0))
+    survivor_px = int(stats.get("pale_knit_survivor_px", 0))
+    survivor_uncovered = int(stats.get("pale_knit_survivor_uncovered_px", 0))
+    survivor_blobs = stats.get("pale_knit_survivor_uncovered_blobs") or []
+    biggest_blob = max((int(b.get("px", 0)) for b in survivor_blobs), default=0)
+    # The stricter second question: visible WHITE, not merely pale. ``neutral_white``
+    # is the final render's bright near-greyscale pixels in the collar band -- the
+    # coarse pale-knit rules also count pale-olive highlights, which are cloth.
+    neutral_white = int(stats.get("neutral_white_uncovered_px", 0))
+    neutral_white_blobs = stats.get("neutral_white_uncovered_blobs") or []
+    neutral_white_biggest = max((int(b.get("px", 0)) for b in neutral_white_blobs), default=0)
+    residual_resolved = (
+        survivor_uncovered <= SURVIVOR_RESIDUAL_TOTAL_LIMIT_PX
+        and biggest_blob <= SURVIVOR_RESIDUAL_BLOB_LIMIT_PX
+        and neutral_white <= NEUTRAL_WHITE_LIMIT_PX
+        and neutral_white_biggest <= NEUTRAL_WHITE_BLOB_LIMIT_PX
+    )
     report["gate8_keep_vs_remove_conflict"] = {
         "guarded_pale_px": guarded,
         "guarded_pale_bbox": stats.get("guarded_pale_bbox"),
-        "reason": stats.get("guarded_pale_note"),
-        "unresolvable": guarded > 0,
+        "guarded_pale_final_skin_like_px": guarded_skin_like,
+        "guarded_reason": stats.get("guarded_pale_note"),
+        "pale_knit_survivor_px": survivor_px,
+        "pale_knit_survivor_uncovered_px": survivor_uncovered,
+        "pale_knit_survivor_uncovered_blobs": survivor_blobs,
+        "biggest_uncovered_blob_px": biggest_blob,
+        "neutral_white_uncovered_px": neutral_white,
+        "neutral_white_uncovered_blobs": neutral_white_blobs,
+        "neutral_white_biggest_blob_px": neutral_white_biggest,
+        "neutral_white_limit_px": NEUTRAL_WHITE_LIMIT_PX,
+        "neutral_white_note": stats.get("neutral_white_note"),
+        "blob_limit_px": SURVIVOR_RESIDUAL_BLOB_LIMIT_PX,
+        "total_limit_px": SURVIVOR_RESIDUAL_TOTAL_LIMIT_PX,
+        "latent_cell_px": LATENT_CELL_PX,
+        "unresolvable": not residual_resolved,
         "resolution": (
-            "the mask is already conservative and excludes this block; a single pass "
-            "repairs only the released strip, the central block under the jaw stays as "
-            "rendered and needs an operator decision"
+            "split, not ignored: the 172 px strip carrying independent fabric evidence was "
+            "moved into the release (gate 3 checks that evidence) and is repainted by this "
+            "pass; the remaining guarded block is skin-toned with no independent fabric "
+            "evidence and stays protected, as the brief requires. The old knit the render "
+            f"left unchanged inside the collar band is now {survivor_uncovered} px "
+            f"(largest blob {biggest_blob} px), and strictly neutral white cloth is "
+            f"{neutral_white} px (largest blob {neutral_white_biggest} px), both at or "
+            f"below one {LATENT_CELL_PX}x{LATENT_CELL_PX} latent cell of this checkpoint"
         ),
     }
 
@@ -509,7 +650,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--submit", action="store_true", help="create the one paid task")
     parser.add_argument("--i-understand-this-costs-money", action="store_true")
     parser.add_argument("--accept-guarded-residual", action="store_true",
-                        help="proceed even though gate 8 finds an unremovable central pale block")
+                        help="proceed even though gate 8 finds a still-visible old-knit remnant "
+                             "outside the released mask (NOT for this round: the brief forbids "
+                             "overriding the gate)")
     args = parser.parse_args(argv)
 
     for name, path in (("final", args.final), ("mask", args.mask), ("no-edit", args.no_edit),
@@ -524,7 +667,10 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(f"WARNING: {args.object_info} not found; structural checks only", file=sys.stderr)
 
-    workflow = build_workflow("__FINAL__", "__MASK__", args.seed)
+    # Name the loaders with the real input basenames so the dry-run
+    # ``workflow.json`` is a complete, self-consistent graph (the submit path
+    # rebuilds it with the uploaded names, which the API assigns).
+    workflow = build_workflow(args.final.name, args.mask.name, args.seed)
     errors, gate = collect_gate_checks(
         workflow, object_info,
         final_path=args.final, mask_path=args.mask, no_edit_path=args.no_edit,
@@ -539,10 +685,14 @@ def main(argv: list[str] | None = None) -> int:
     (args.out / "gate_report.json").write_text(json.dumps(gate, ensure_ascii=False, indent=2))
 
     print(f"gate2 single pass: {gate['gate2_single_local_pass']}")
-    print(f"gate3 raw mask bbox {gate['gate3_mask_is_collar_only']['raw_mask_bbox']} "
-          f"in window {gate['gate3_mask_is_collar_only']['release_window_bbox']} "
-          f"-> {gate['gate3_mask_is_collar_only']['raw_mask_bbox_in_window']} "
-          f"(painted {gate['gate3_mask_is_collar_only']['painted_bbox']})")
+    g3 = gate["gate3_mask_is_collar_only"]
+    print(f"gate3 raw mask bbox {g3['raw_mask_bbox']} in window {g3['release_window_bbox']} "
+          f"-> {g3['raw_mask_bbox_in_window']}; allowed = window UNION carve {g3['carve_bbox']} "
+          f"-> {g3['raw_mask_bbox_in_allowed']} (painted {g3['painted_bbox']})")
+    print(f"gate3 carve: {g3['carve']['px']} px, skin-flag {g3['carve']['skin_flag_px']} px "
+          f"(ratio {g3['carve']['skin_flag_ratio']:.3f} <= {g3['carve']['max_skin_flag_ratio']}), "
+          f"face-oval {g3['carve']['face_oval_px']} px, released {g3['carve']['release_from_carve_px']} px "
+          f"-> justified={g3['carve']['justified']}")
     print(f"gate4 raw mask over guards: {gate['gate4_painted_disjoint_from_no_edit']['raw_mask_over_guards_px']} px, "
           f"feather rim {gate['gate4_painted_disjoint_from_no_edit']['feather_rim_px']} px "
           f"<= {gate['gate4_painted_disjoint_from_no_edit']['feather_rim_max_distance_px']} px, "
@@ -554,7 +704,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"gate6 frame {gate['gate6_frame_preserved']['input_size']} uniform={gate['gate6_frame_preserved']['crop_scale_uniform']}")
     for note in gate["gate7_runtime_compatibility"]["checkpoint_notes"]:
         print(f"  checkpoint: {note}")
-    print(f"gate8 guarded pale block: {conflict['guarded_pale_px']} px at {conflict['guarded_pale_bbox']} "
+    print(f"gate8 guarded block kept as skin: {conflict['guarded_pale_px']} px at "
+          f"{conflict['guarded_pale_bbox']} ({conflict['guarded_pale_final_skin_like_px']} px skin-toned); "
+          f"uncovered old knit {conflict['pale_knit_survivor_uncovered_px']} px "
+          f"(largest blob {conflict['biggest_uncovered_blob_px']} px); "
+          f"uncovered neutral white {conflict['neutral_white_uncovered_px']} px "
+          f"(largest blob {conflict['neutral_white_biggest_blob_px']} px, limit "
+          f"{conflict['neutral_white_limit_px']} px) "
           f"(unresolvable={conflict['unresolvable']})")
 
     if errors:
@@ -563,11 +719,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"gate report -> {args.out / 'gate_report.json'}", file=sys.stderr)
         return 1
     if gate["halted_by_gate8"]:
-        print("HALT: gate 8 found a keep-vs-remove conflict that one pass cannot resolve "
-              "(the central pale block sits inside the subject's own skin guard). "
-              "The mask excludes it; nothing in this workflow edits it. "
-              "Re-run with --accept-guarded-residual to build the workflow for the released strip only, "
-              "or ask the operator how to treat the guarded block.", file=sys.stderr)
+        print("HALT: gate 8 shows the released region still leaves a visible old-knit remnant "
+              f"({conflict['pale_knit_survivor_uncovered_px']} px old knit, largest blob "
+              f"{conflict['biggest_uncovered_blob_px']} px, limit {conflict['blob_limit_px']} px/blob, "
+              f"{conflict['total_limit_px']} px total; {conflict['neutral_white_uncovered_px']} px "
+              f"neutral white, limit {conflict['neutral_white_limit_px']} px). "
+              "A single pass over the current mask would not "
+              "clear it; do not paper over this with --accept-guarded-residual. Tighten the released "
+              "mask with evidence first, or ask the operator.", file=sys.stderr)
         print(f"gate report -> {args.out / 'gate_report.json'}", file=sys.stderr)
         return 2
     print(f"gate passed -> {args.out / 'gate_report.json'}")

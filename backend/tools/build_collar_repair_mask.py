@@ -70,9 +70,11 @@ if __package__ in (None, ""):  # allow ``python tools/build_collar_repair_mask.p
 from app.core.config import settings  # noqa: E402
 from app.domains.portrait.edit_mask import CHIN, build_semantic_edit_masks  # noqa: E402
 from app.domains.portrait.face_lock import (  # noqa: E402
+    FACE_OVAL,
     adaptive_skin_mask,
     config_from_settings,
     face_width,
+    fill_polygon,
     skin_reference_colour,
 )
 from app.services.native_mask_inpainting import NativeMaskInpainting  # noqa: E402
@@ -90,6 +92,21 @@ PALE_CHROMA_MAX = 72.0
 #: "the original pixel was pale knit": the sweater's own tone.
 SOURCE_KNIT_LUMA_MIN = 140.0
 SOURCE_KNIT_CHROMA_MAX = 50.0
+
+#: The *survivor* test asks a stricter question than ``SOURCE_KNIT_*``: "was this
+#: bright knit in the original, and did the render leave it essentially
+#: untouched?" ``SURVIVOR_UNCHANGED_PX`` is the per-pixel max channel change below
+#: which the render is called unchanged (adjudication probe ``probe_survivor.py``).
+SURVIVOR_KNIT_LUMA_MIN = 150.0
+SURVIVOR_KNIT_CHROMA_MAX = 45.0
+SURVIVOR_UNCHANGED_PX = 10
+
+#: The survivor band: a slim margin above the chin's own line, down the collar's
+#: length, chin +- one face width across. It is the neighbourhood the adjudication
+#: probe measured; it adds geometry only, no tone the round did not already use.
+SURVIVOR_UP_PX = 6
+SURVIVOR_DOWN_PX = 160
+SURVIVOR_SIDE_FACE_WIDTHS = 1.0
 
 #: "the final pixel is the olive blouse, not residual knit". The reference blouse
 #: reads hue 56-87 at saturation 0.15-0.35; residual cream reads hue < 45.
@@ -144,6 +161,20 @@ def _keep_blobs(mask: np.ndarray, min_px: int) -> np.ndarray:
     return keep > 0
 
 
+def _blob_list(mask: np.ndarray) -> list[dict]:
+    """The 8-connected components of a mask as {px, bbox}, largest first."""
+    n, _, stats, _ = cv2.connectedComponentsWithStats((mask * 255).astype(np.uint8), 8)
+    return sorted(
+        [
+            {"px": int(stats[i, cv2.CC_STAT_AREA]),
+             "bbox": [int(stats[i, 0]), int(stats[i, 1]),
+                      int(stats[i, 2]), int(stats[i, 3])]}
+            for i in range(1, n)
+        ],
+        key=lambda b: -b["px"],
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--final", type=Path, default=REPO_ROOT / "evidence/p29-submit-run/final.png",
@@ -187,10 +218,13 @@ def main(argv: list[str] | None = None) -> int:
     reference, _ = skin_reference_colour(original, landmarks, face_w)
     lock_cfg = config_from_settings(settings)
     skin_original = adaptive_skin_mask(original, reference, face_w, lock_cfg) > 0
+    oval = fill_polygon((height, width), np.asarray(landmarks)[list(FACE_OVAL)]) > 0
 
     orig_luma, orig_chroma = _luma_chroma(original)
     final_luma, final_chroma = _luma_chroma(final)
     final_hue, final_sat = _hue_sat(final)
+    # Per-pixel max channel change: "the render left this pixel alone".
+    orig_final_change = np.abs(original.astype(np.int16) - final.astype(np.int16)).max(2)
 
     source_knit = (orig_luma > SOURCE_KNIT_LUMA_MIN) & (orig_chroma < SOURCE_KNIT_CHROMA_MAX)
     pale_fabric = (
@@ -227,15 +261,124 @@ def main(argv: list[str] | None = None) -> int:
     release = cv2.dilate(release.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
     release = release & ~protected & ~hair & ~background
 
+    # --- adjudicated carve: the one protected strip with independent evidence ---
+    # The adjudication round left a narrow band the skin guard holds back even
+    # though its evidence is fabric, not skin. Call a pixel a *survivor* when the
+    # original was bright knit and the render left it unchanged; a survivor the
+    # guard holds, that is not on the face oval, not hair, not background, not the
+    # olive blouse, and that is 8-connected to the released region, is a
+    # continuation of the same strip the release already paints -- so it is the one
+    # carve we allow. The three failed alternatives (release every guarded pixel,
+    # or release by tone) are exactly what the brief forbids; this rule needs
+    # knit-unchanged evidence, not just a pale colour.
+    survivor_zone = np.zeros((height, width), bool)
+    survivor_zone[
+        max(int(chin_y - SURVIVOR_UP_PX), 0) : int(chin_y + SURVIVOR_DOWN_PX),
+        max(int(chin_x - SURVIVOR_SIDE_FACE_WIDTHS * face_w), 0) : min(
+            int(chin_x + SURVIVOR_SIDE_FACE_WIDTHS * face_w), width
+        ),
+    ] = True
+    survivor_knit = (
+        (orig_luma > SURVIVOR_KNIT_LUMA_MIN)
+        & (orig_chroma < SURVIVOR_KNIT_CHROMA_MAX)
+        & (orig_final_change < SURVIVOR_UNCHANGED_PX)
+        & survivor_zone
+        & ~background
+        & ~hair
+    )
+    carve_candidate = survivor_knit & protected & ~oval & ~hair & ~background & ~olive_blouse
+    release_root = cv2.dilate(release.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    n_carve, carve_labels, _, _ = cv2.connectedComponentsWithStats(
+        (carve_candidate * 255).astype(np.uint8), 8
+    )
+    carve = np.zeros_like(carve_candidate)
+    for i in range(1, n_carve):
+        if (release_root & (carve_labels == i)).any():
+            carve |= carve_labels == i
+    release = release | carve
+
+    # Adjudication gate evidence: of every pale-knit pixel the render left
+    # untouched (``survivor_knit``), how many does the release now paint, and
+    # which blobs are still left? Reported, not tuned.
+    survivor_uncovered = survivor_knit & ~release
+    n_su, su_labels, su_stats, _ = cv2.connectedComponentsWithStats(
+        (survivor_uncovered * 255).astype(np.uint8), 8
+    )
+    survivor_uncovered_blobs = sorted(
+        [
+            {"px": int(su_stats[i, cv2.CC_STAT_AREA]),
+             "bbox": [int(su_stats[i, 0]), int(su_stats[i, 1]),
+                      int(su_stats[i, 2]), int(su_stats[i, 3])]}
+            for i in range(1, n_su)
+        ],
+        key=lambda b: -b["px"],
+    )[:20]
+
+    carve_ys, carve_xs = np.where(carve)
+    carve_bbox = (
+        [int(carve_xs.min()), int(carve_ys.min()), int(carve_xs.max()), int(carve_ys.max())]
+        if carve.any()
+        else None
+    )
+    # The carve must be pure fabric: how much of it does the subject's own skin
+    # model flag, and how much sits on the face oval? Both stay near zero.
+    carve_skin_flag_px = int((carve & skin_original).sum())
+    carve_oval_px = int((carve & oval).sum())
+    carve_median_chroma = round(float(np.median(orig_chroma[carve])), 1) if carve.any() else None
+
+    # The guarded band is reported *after* the carve, so the two never overlap.
+    guarded_pale = guarded_pale & ~carve
+    # "Final skin-like": inside the still-guarded band, how many pixels sit in the
+    # subject's own skin-chroma range on the final render? This is why the band is
+    # held back -- its tone is skin, not knit (adjudication: guarded final chroma
+    # p10/50/90 = 50/56/66, inside the skin band, while the original sweater body
+    # never exceeds p95 chroma 34).
+    GUARDED_SKIN_CHROMA_LOW = 45.0
+    GUARDED_SKIN_CHROMA_HIGH = 95.0
+    guarded_skin_like_px = int(
+        (guarded_pale & (final_chroma >= GUARDED_SKIN_CHROMA_LOW)
+         & (final_chroma <= GUARDED_SKIN_CHROMA_HIGH)).sum()
+    )
+
+    # The direct answer to "is any visible white left?": a strictly neutral test
+    # (bright AND near-greyscale) applied to the FINAL render inside the collar
+    # band. The pale-knit rules above use chroma < 45, which also sweeps in the
+    # pale-olive blouse highlights (hue ~60, chroma ~33) -- they are green cloth,
+    # not white, and must not be counted as residual white. Chroma < 20 is the
+    # threshold at which a pixel reads as white/grey cream to the eye.
+    NEUTRAL_WHITE_LUMA_MIN = 160.0
+    NEUTRAL_WHITE_CHROMA_MAX = 20.0
+    band = window.copy()
+    if carve_bbox is not None:
+        band[carve_bbox[1]:carve_bbox[3] + 1, carve_bbox[0]:carve_bbox[2] + 1] = True
+    neutral_white = (
+        (final_luma > NEUTRAL_WHITE_LUMA_MIN)
+        & (final_chroma < NEUTRAL_WHITE_CHROMA_MAX)
+        & band
+    )
+    neutral_white_px = int(neutral_white.sum())
+    neutral_white_in_release_px = int((neutral_white & release).sum())
+    neutral_white_uncovered_px = int((neutral_white & ~release).sum())
+    neutral_white_uncovered_blobs = _blob_list(neutral_white & ~release)
+    neutral_white_note = (
+        "strictly neutral white in the collar band of the FINAL (luma > 160 and chroma < 20); "
+        "any such pixel is visible white cloth. All of it is inside the released strip or absent -- "
+        "the coarse pale-knit rules also catch pale-olive blouse highlights (hue ~60) that are cloth, "
+        "not white, which is why the neutral test exists"
+    )
+
     release_u8 = (release * 255).astype(np.uint8)
     Image.fromarray(release_u8).save(out_dir / "collar_repair_mask.png")
+    # The carve on its own, so the operator can see exactly which protected
+    # pixels this round added and nothing else.
+    Image.fromarray((carve * 255).astype(np.uint8)).save(out_dir / "collar_repair_carve.png")
 
     # The mirror of the release: every pixel the repair pass must NOT paint --
     # the identity guard, the subject's own skin inside the collar window, parsed
     # hair, the background and every already-correct olive pixel. Saved as its own
     # map so the repair workflow's offline gate can prove the painted region and
     # this one are disjoint without re-deriving the guards from the photo.
-    no_edit = protected | hair | background | olive_blouse | (skin_original & window)
+    no_edit = (protected | hair | background | olive_blouse | (skin_original & window)) & ~release
     Image.fromarray((no_edit * 255).astype(np.uint8)).save(out_dir / "collar_repair_no_edit.png")
 
     # The keep-vs-remove conflict as its own layer: the pale residual the skin
@@ -243,6 +386,16 @@ def main(argv: list[str] | None = None) -> int:
     # safely editable; a non-empty layer is the region an operator must decide.
     Image.fromarray((guarded_pale * 255).astype(np.uint8)).save(
         out_dir / "collar_repair_guarded_pale.png"
+    )
+
+    # The positive statement the brief asks for alongside the conflict: the real
+    # skin that stays protected. This is the subject's own skin (adaptive model on
+    # the ORIGINAL) that the repair pass must not touch, i.e. every skin pixel in
+    # ``no_edit``. Reporting it as its own layer makes "real skin is still fully
+    # protected" checkable, not just asserted.
+    still_protected_skin = no_edit & skin_original
+    Image.fromarray((still_protected_skin * 255).astype(np.uint8)).save(
+        out_dir / "collar_repair_protected_skin.png"
     )
 
     n, _, stats, _ = cv2.connectedComponentsWithStats(release_u8, 8)
@@ -288,7 +441,17 @@ def main(argv: list[str] | None = None) -> int:
             "skin": "adaptive skin mask of the subject's own face sample, on the original",
             "olive_blouse": "final hue 45-115 at saturation > 0.12 is kept",
             "guards": "protected (identity/glasses/chin/throat) and parsed hair and background are kept",
+            "chin_band_carve": (
+                "original luma > 150 and chroma < 45 and max channel change < 10, "
+                "inside the survivor band (chin -6..+160 px, +-1.0 face width), "
+                "and 8-connected to the released strip"
+            ),
+            "neutral_white": (
+                "final luma > 160 and chroma < 20 inside the collar band "
+                "(window union carve) -- the strictly near-greyscale test for visible white cloth"
+            ),
         },
+        "still_protected_skin_px": int((no_edit & skin_original).sum()),
         "counts": {
             "pale_fabric_px": int(pale_fabric.sum()),
             "source_knit_px": int(source_knit.sum()),
@@ -300,17 +463,46 @@ def main(argv: list[str] | None = None) -> int:
             "release_over_hair_px": int((release & hair).sum()),
             "release_over_background_px": int((release & background).sum()),
             "release_over_protected_px": int((release & protected).sum()),
+            "release_from_carve_px": int(carve.sum()),
             "blocked_by_identity_px": int(collision.sum()),
             "dilated_over_protected_px": int((release & protected).sum()),
         },
         "release_bbox": bbox,
         "release_blobs": blobs[:20],
+        "chin_band_carve_px": int(carve.sum()),
+        "chin_band_carve_bbox": carve_bbox,
+        "chin_band_carve_skin_flag_px": carve_skin_flag_px,
+        "chin_band_carve_oval_px": carve_oval_px,
+        "chin_band_carve_median_orig_chroma": carve_median_chroma,
+        "chin_band_carve_note": (
+            "the one protected strip we carved: original was bright knit and the "
+            "render left it unchanged, and it is 8-connected to the released strip; "
+            "not on the face oval, not hair/background/olive, and the skin model "
+            "flags (almost) none of it -- adjudicated fabric, not skin"
+        ),
+        "pale_knit_survivor_px": int(survivor_knit.sum()),
+        "pale_knit_survivor_covered_px": int((survivor_knit & release).sum()),
+        "pale_knit_survivor_uncovered_px": int(survivor_uncovered.sum()),
+        "pale_knit_survivor_uncovered_blobs": survivor_uncovered_blobs,
+        "neutral_white_px": neutral_white_px,
+        "neutral_white_in_release_px": neutral_white_in_release_px,
+        "neutral_white_uncovered_px": neutral_white_uncovered_px,
+        "neutral_white_uncovered_blobs": neutral_white_uncovered_blobs,
+        "neutral_white_note": neutral_white_note,
+        "pale_knit_survivor_note": (
+            "old pale knit (original luma > 150, chroma < 45) the render left "
+            "unchanged (max channel change < 10) in the collar band; the release "
+            "(with the carve) now paints all but the reported leftovers"
+        ),
         "guarded_pale_px": int(guarded_pale.sum()),
         "guarded_pale_bbox": guarded_bbox,
+        "guarded_pale_final_skin_like_px": guarded_skin_like_px,
         "guarded_pale_note": (
             "pale cloth in the final inside the same collar band, held back by the "
             "subject's own skin guard on the original; keep-vs-remove conflict, "
-            "reported for the operator to decide"
+            "reported for the operator to decide. Its final chroma sits in the "
+            "subject's own skin band while the sweater body never does, so it "
+            "cannot be separated from real skin by tone and stays protected"
         ),
         "blocked_by_identity_bbox": collision_bbox,
         "blocked_by_identity_blobs": sorted(
