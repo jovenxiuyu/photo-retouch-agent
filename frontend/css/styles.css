@@ -144,6 +144,44 @@ button {
   gap: 8px;
 }
 
+/*
+ * 图片工作台下挂两个工作台；两个页面的切换器位置一致，用户始终知道自己在
+ * 哪一面、以及怎么切回去。
+ */
+.workbench-switch {
+  display: inline-flex;
+  gap: 2px;
+  margin-right: 6px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--canvas);
+}
+
+.workbench-tab {
+  display: inline-flex;
+  height: 30px;
+  align-items: center;
+  padding: 0 12px;
+  border-radius: 8px;
+  color: #6d7876;
+  font-size: 12px;
+  font-weight: 700;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.workbench-tab:hover {
+  color: var(--green-dark);
+  background: #fff;
+}
+
+.workbench-tab.is-active,
+.workbench-tab.is-active:hover {
+  color: #fff;
+  background: linear-gradient(140deg, var(--green), var(--green-dark));
+}
+
 .prototype-pill {
   margin-right: 6px;
   padding: 6px 9px;

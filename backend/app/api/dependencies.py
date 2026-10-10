@@ -19,6 +19,7 @@ from app.domains.registry import DomainRegistry
 from app.infrastructure.storage import StorageService
 from app.infrastructure.job_store import JobStore
 from app.services.retouch_service import RetouchService
+from app.services.studio_service import StudioService
 from app.providers.factory import ImageProviderFactory
 from app.brains.factory import AgentBrainFactory
 from app.services.task_queue import TaskQueue
@@ -106,3 +107,10 @@ def get_create_styling_proposals_use_case(
     domains: Annotated[DomainRegistry, Depends(get_domain_registry)],
 ) -> CreateStylingProposals:
     return CreateStylingProposals(RegistryStylingCatalog(domains))
+
+
+def get_studio_service(
+    container: Annotated[AppContainer, Depends(get_container)],
+    storage: Annotated[StorageService, Depends(get_storage_service)],
+) -> StudioService:
+    return StudioService(container.settings, storage=storage)

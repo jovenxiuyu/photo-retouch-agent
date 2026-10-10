@@ -5,18 +5,18 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       name="description"
-      content="AI Beauty Style Lab — AI 个人形象设计软件（Photo Retouch Agent 人像美化工作台）"
+      content="图片工作台 — 生图工作台 + 美颜工作台（AI 个人形象设计与人像美化）"
     />
-    <title>AI Beauty Style Lab · Photo Retouch Agent</title>
+    <title>美颜工作台 · 图片工作台</title>
     <link rel="stylesheet" href="./css/styles.css?v=0.6.2" />
   </head>
   <body>
     <header class="app-header">
-      <a class="brand" href="/" aria-label="AI Beauty Style Lab 首页">
-        <span class="brand-mark">AB</span>
+      <a class="brand" href="./index.html" aria-label="图片工作台 首页">
+        <span class="brand-mark">图</span>
         <span class="brand-copy">
-          <strong>AI Beauty Style Lab</strong>
-          <small>AI 造型设计工作室</small>
+          <strong>图片工作台</strong>
+          <small>美颜工作台 · AI 造型设计</small>
         </span>
       </a>
 
@@ -27,6 +27,10 @@
       </div>
 
       <div class="header-actions">
+        <nav class="workbench-switch" aria-label="工作台切换">
+          <a class="workbench-tab" href="./studio.html">生图工作台</a>
+          <a class="workbench-tab is-active" href="./index.html" aria-current="page">美颜工作台</a>
+        </nav>
         <span class="prototype-pill">PROTOTYPE · V0.1</span>
         <button class="icon-button" id="undoButton" type="button" title="撤销">
           ↶
@@ -152,7 +156,7 @@
             <span class="ai-orbit">✦</span>
             <div>
               <strong>AI 根据你的照片设计三套造型</strong>
-              <p>上传本人照片 → AI 设计发型／服装／妆容三套方案 → 选一套生成改造效果。图像生成默认使用本地模拟（不计费），切换到真实模型时会先确认费用。</p>
+              <p>上传本人照片 → AI 设计发型／服装／妆容三套方案 → 选一套生成改造效果。当前 DeepSeek 没有图像输入能力，它不会直接看你的原图，而是依据本地程序测量的 FaceFacts（脸型、五官比例、肤色、是否戴眼镜等）进行设计。图像生成默认使用本地模拟（不计费），切换到真实模型时会先确认费用。</p>
             </div>
           </div>
 
@@ -163,14 +167,14 @@
           <div class="styling-toolbar">
             <button class="styling-design-button" id="stylingDesignButton" type="button">
               <span>✦</span>
-              <b>AI 设计三套造型（1 次分析 + 1 次设计）</b>
+              <b>AI 设计三套造型（本步 2 次 · 全程最多 3 次）</b>
             </button>
             <button class="styling-template-button" id="stylingTemplateButton" type="button">
               <span>◈</span>
               <b>免费模板预览（0 次调用）</b>
             </button>
             <small id="stylingCostNote" class="styling-cost">
-              AI 设计：本流程含 1 次人物视觉分析 + 1 次造型设计，共 2 次付费模型调用；该照片已有有效分析缓存时复用分析，只计 1 次。免费模板预览 0 次调用。出图只对选中的一套发起 1 次图像编辑请求。
+              AI 设计：完整流程含 1 次人物事实分析 + 1 次造型设计 + 1 次出图提示词规划，共 3 次付费模型调用；该照片已有有效分析缓存时复用分析，只计 2 次。无图像输入能力的模型（如 DeepSeek）不会看到原图，只依据本地程序测量的 FaceFacts 设计，并未直接做视觉看图分析。免费模板预览 0 次调用。出图只对选中的一套发起 1 次图像编辑请求。
             </small>
           </div>
           <div class="styling-grid" id="stylingGrid" hidden></div>
@@ -491,7 +495,7 @@
       <p class="cost-dialog-lead" id="costDialogLead"></p>
       <dl class="cost-breakdown">
         <div>
-          <dt id="costDesignLabel">SiliconFlow 造型设计</dt>
+          <dt id="costDesignLabel">AI 造型设计</dt>
           <dd id="costDesignValue">0 次</dd>
         </div>
         <div>
