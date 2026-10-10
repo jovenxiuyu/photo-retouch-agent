@@ -69,3 +69,45 @@ evidence/p29-neck-fix/*
 evidence/p29-collar-repair/*
 !evidence/p29-collar-repair/*.json
 !evidence/p29-collar-repair/*.py
+
+# Cached segmentation / label arrays: derived from the subject's own photo, so
+# they follow the same local-only rule as the renders they were cut from.
+evidence/**/*.npy
+
+# MVP acceptance run: the screenshots, the recorder logs and the working
+# preflight package all reproduce the subject's own photo, so they stay
+# local-only. The write-up is evidence/mvp-acceptance-report.md; keep the probe
+# scripts and the derived summaries, which hold no image data.
+evidence/mvp-acceptance/*
+!evidence/mvp-acceptance/*.py
+!evidence/mvp-acceptance/*.mjs
+!evidence/mvp-acceptance/*.json
+!evidence/mvp-acceptance/*.jsonl
+
+# P2.9 collar adjudication: the 8x/10x render panels and the cached label
+# arrays reproduce the subject's own photo, so they stay local-only. The
+# write-up is evidence/p29-collar-adjudication-report.md; keep the probe
+# scripts and the derived measurements.
+evidence/p29-collar-adjudication/*
+!evidence/p29-collar-adjudication/*.py
+!evidence/p29-collar-adjudication/*.json
+
+# P2.9 collar-residual mask regeneration: same rule -- the zoom renders and the
+# cached arrays stay local-only, the write-up is
+# evidence/p29-collar-residual-mask-report.md; keep the probe scripts, the
+# derived stats and the saved console output they printed.
+evidence/p29-collar-residual-mask/*
+!evidence/p29-collar-residual-mask/*.py
+!evidence/p29-collar-residual-mask/*.json
+!evidence/p29-collar-residual-mask/*.txt
+!evidence/p29-collar-residual-mask/*.out
+!evidence/p29-collar-residual-mask/*.err
+
+# Studio workbench e2e: the shots reproduce the workbench UI together with the
+# uploaded photo, so they stay local-only; keep the script that drives them.
+evidence/studio-workbench/*
+!evidence/studio-workbench/*.mjs
+
+# macOS app packaging: the icon set and the ad-hoc signed bundle under build/
+# are intermediates that build_app.sh regenerates from make_icon.py.
+packaging/macos/build/
