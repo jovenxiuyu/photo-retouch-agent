@@ -424,6 +424,53 @@ select:focus {
   border-color: var(--accent);
 }
 
+/* 反推入口：和「生成」并列，但基调更轻——它是备选手段，不是主按钮。 */
+.field-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 18px 0 8px;
+}
+
+.field-head .field-label {
+  margin: 0;
+}
+
+.field-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.compact-select {
+  width: auto;
+  padding: 8px 10px;
+  font-size: 14px;
+  border-radius: 999px;
+}
+
+.ghost-button.is-compact {
+  padding: 8px 14px;
+  font-size: 14px;
+  border-radius: 999px;
+}
+
+.ghost-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.ghost-button:disabled:hover {
+  border-color: var(--line);
+}
+
+.chips-interrogate {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--line);
+}
+
 .advanced {
   margin-top: 20px;
   border-top: 1px solid var(--line);

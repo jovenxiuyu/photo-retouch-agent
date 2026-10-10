@@ -20,6 +20,10 @@ data/models/
 evidence/*.png
 evidence/**/*.png
 
+# 反推提示词的原始返回体含对真人外貌的文字描述，和原始照片同属隐私 -- 只留本地。
+# 判定与路径记录在 evidence/studio-interrogate-live-check.md，可付费重跑复现。
+evidence/interrogate-live-result.json
+
 # Local edit packages hold a copy of the subject's own photo and the masks
 # derived from it; keep the generator (tools.build_local_edit_package), not the
 # output. Regenerate with: python -m tools.build_local_edit_package --photo <img> --style <id>

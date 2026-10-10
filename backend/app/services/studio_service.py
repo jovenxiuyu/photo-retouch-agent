@@ -40,6 +40,10 @@ from app.providers.studio_image_provider import (
     StudioImageProvider,
 )
 from app.services.storage import StorageService
+from app.services.studio_interrogate import (
+    DEFAULT_INTERROGATE_MODEL,
+    INTERROGATE_MODELS,
+)
 
 logger = logging.getLogger("photo_retouch.studio")
 
@@ -164,6 +168,10 @@ class StudioService:
             "defaultEditModel": "Qwen/Qwen-Image-Edit-2509",
             "defaultTextModel": "Qwen/Qwen-Image",
             "models": [model.to_payload() for model in STUDIO_MODELS],
+            # The reverse-prompt catalogue is listed here so the page can build
+            # its picker from one status call instead of a second round trip.
+            "interrogateModels": [model.to_payload() for model in INTERROGATE_MODELS],
+            "interrogateModel": DEFAULT_INTERROGATE_MODEL if configured else "",
             "maxRenders": MAX_RENDERS_PER_REQUEST,
             "maxUploadMb": self.config.max_upload_bytes // (1024 * 1024),
             "note": (

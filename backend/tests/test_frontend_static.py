@@ -25,6 +25,9 @@ def test_frontend_studio_page_is_served(client: TestClient) -> None:
     assert './js/studio.js' in response.text
     assert 'id="promptInput"' in response.text
     assert 'id="confirmAccept"' in response.text
+    assert 'id="interrogateButton"' in response.text
+    assert 'id="interrogateModelSelect"' in response.text
+    assert 'id="interrogateFocus"' in response.text
 
 
 def test_frontend_js_is_served(client: TestClient) -> None:

@@ -197,6 +197,29 @@ class OpenAICompatiblePromptBrain:
             }
         )
 
+    async def complete_vision_json(
+        self,
+        *,
+        system_prompt: str,
+        user_text: str,
+        image_path: Path,
+        temperature: float = 0.2,
+    ) -> dict[str, Any]:
+        """One vision turn whose answer must be a single JSON object.
+
+        ``analyze`` and ``optimize`` each hard-code their own business schema on
+        top of this call. The studio's prompt interrogator needs the same
+        "look at the picture, answer in JSON" turn without inheriting either
+        schema, so the primitive is public instead of a private helper.
+        """
+        content = await self._complete(
+            system_prompt,
+            user_text,
+            image_path,
+            temperature,
+        )
+        return self._parse_json_object(content)
+
     async def _complete(
         self,
         system_prompt: str,

@@ -19,6 +19,7 @@ from app.domains.registry import DomainRegistry
 from app.infrastructure.storage import StorageService
 from app.infrastructure.job_store import JobStore
 from app.services.retouch_service import RetouchService
+from app.services.studio_interrogate import StudioInterrogateService
 from app.services.studio_service import StudioService
 from app.providers.factory import ImageProviderFactory
 from app.brains.factory import AgentBrainFactory
@@ -114,3 +115,10 @@ def get_studio_service(
     storage: Annotated[StorageService, Depends(get_storage_service)],
 ) -> StudioService:
     return StudioService(container.settings, storage=storage)
+
+
+def get_studio_interrogate_service(
+    container: Annotated[AppContainer, Depends(get_container)],
+    storage: Annotated[StorageService, Depends(get_storage_service)],
+) -> StudioInterrogateService:
+    return StudioInterrogateService(container.settings, storage=storage)

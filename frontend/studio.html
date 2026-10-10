@@ -8,7 +8,7 @@
       content="图片工作台 — 生图工作台：自然语言生图 / 改图（SiliconFlow / Qwen-Image）"
     />
     <title>生图工作台 · 图片工作台</title>
-    <link rel="stylesheet" href="./css/studio.css?v=0.1.0" />
+    <link rel="stylesheet" href="./css/studio.css?v=0.2.0" />
   </head>
   <body>
     <header class="topbar">
@@ -65,13 +65,28 @@
           <button class="mode-button" data-mode="text2image" type="button">凭空生成</button>
         </div>
 
-        <label class="field-label" for="promptInput">提示词</label>
+        <div class="field-head">
+          <label class="field-label" for="promptInput">提示词</label>
+          <div class="field-head-actions">
+            <select id="interrogateFocus" class="compact-select" aria-label="反推方式">
+              <option value="replicate">复刻这张画面</option>
+              <option value="style">只要风格和色调</option>
+            </select>
+            <button class="ghost-button is-compact" type="button" id="interrogateButton">
+              反推提示词
+            </button>
+          </div>
+        </div>
+        <p class="field-note" id="interrogateNote">
+          不知道怎么写？上传图后点「反推提示词」，让视觉模型看图写一段，再直接出图。
+        </p>
         <textarea
           id="promptInput"
           rows="6"
           placeholder="例：把背景换成清晨的海边，光线柔和，保留人物面部不变"
         ></textarea>
 
+        <div class="chips chips-interrogate" id="interrogateChips" hidden></div>
         <div class="chips" id="promptChips"></div>
 
         <details class="advanced">
@@ -80,6 +95,10 @@
           <label class="field-label" for="modelSelect">模型</label>
           <select id="modelSelect"></select>
           <p class="field-note" id="modelNote"></p>
+
+          <label class="field-label" for="interrogateModelSelect">反推模型（看图写提示词）</label>
+          <select id="interrogateModelSelect"></select>
+          <p class="field-note" id="interrogateModelNote"></p>
 
           <label class="field-label" for="sizeSelect" id="sizeLabel" hidden>画布尺寸</label>
           <select id="sizeSelect" hidden></select>
@@ -139,7 +158,7 @@
       <div class="modal" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
         <h3 id="confirmTitle">这次要花钱，确认一下</h3>
         <dl class="confirm-facts" id="confirmFacts"></dl>
-        <p class="confirm-warning">
+        <p class="confirm-warning" id="confirmWarning">
           点击「确认并生成」就会真的向 SiliconFlow 发起付费请求，费用计入你的硅基流动账单。
           取消则不会发出任何请求。
         </p>
@@ -150,6 +169,6 @@
       </div>
     </div>
 
-    <script type="module" src="./js/studio.js?v=0.1.0"></script>
+    <script type="module" src="./js/studio.js?v=0.2.0"></script>
   </body>
 </html>

@@ -66,11 +66,16 @@ const PROMPT_CHIPS = {
 const state = {
   configured: false,
   models: [],
+  interrogateModels: [],
+  interrogateDefaultModel: "",
   maxRenders: FALLBACK_MAX_RENDERS,
   maxUploadMb: FALLBACK_MAX_UPLOAD_MB,
   mode: EDIT,
   source: null,
   busy: false,
+  interrogating: false,
+  pendingAction: null,
+  lastInterrogateRequest: null,
   lastRequest: null,
   lastResult: null,
 };
@@ -93,6 +98,12 @@ function cacheDom() {
     "modeSwitch",
     "promptInput",
     "promptChips",
+    "interrogateButton",
+    "interrogateFocus",
+    "interrogateNote",
+    "interrogateChips",
+    "interrogateModelSelect",
+    "interrogateModelNote",
     "modelSelect",
     "modelNote",
     "sizeLabel",
@@ -115,6 +126,7 @@ function cacheDom() {
     "history",
     "confirmBackdrop",
     "confirmFacts",
+    "confirmWarning",
     "confirmCancel",
     "confirmAccept",
   ];
@@ -201,6 +213,7 @@ function canGenerate() {
   return (
     state.configured &&
     !state.busy &&
+    !state.interrogating &&
     dom.promptInput.value.trim().length > 0 &&
     sourceReady()
   );
@@ -219,10 +232,67 @@ function refreshGenerateButton() {
   dom.generateButton.textContent = "生成（需确认费用）";
 }
 
+/**
+ * 反推也是一次付费动作，所以它的门禁和「生成」一样严：已配置 Key、没有正在
+ * 跑的动作、改图模式、并且真的有一张图可以看。文生图没有输入图，按钮直接
+ * 说明原因，而不是静静失效。
+ */
+function canInterrogate() {
+  return (
+    state.configured &&
+    !state.busy &&
+    !state.interrogating &&
+    state.mode === EDIT &&
+    Boolean(state.source)
+  );
+}
+
+function refreshInterrogateButton() {
+  const button = dom.interrogateButton;
+  button.disabled = !canInterrogate();
+  if (state.interrogating) {
+    button.textContent = "正在读图…";
+    return;
+  }
+  if (!state.configured) {
+    button.textContent = "反推提示词";
+    return;
+  }
+  if (state.mode === TEXT) {
+    button.textContent = "反推只在改图模式";
+    return;
+  }
+  if (!state.source) {
+    button.textContent = "先上传一张图";
+    return;
+  }
+  button.textContent = "反推提示词";
+}
+
+/**
+ * 反推会把这张图交给云端视觉模型——画面内容会以文字形式离开本机。这句话
+ * 必须写在按钮旁边，而不是藏在文档里。
+ */
+function refreshInterrogateNote() {
+  if (state.mode === TEXT) {
+    dom.interrogateNote.textContent =
+      "反推要看图：切回「改这张图」并上传一张图才能用。";
+    return;
+  }
+  if (!state.source) {
+    dom.interrogateNote.textContent =
+      "不知道怎么写？上传图后点「反推提示词」，让视觉模型看图写一段，再直接出图。";
+    return;
+  }
+  dom.interrogateNote.textContent =
+    "会把这张图发给视觉模型换一段描述（独立 1 次付费请求，点击后会先弹确认）。";
+}
+
 function setBusy(busy) {
   state.busy = busy;
   dom.generateButton.classList.toggle("is-busy", busy);
   refreshGenerateButton();
+  refreshInterrogateButton();
 }
 
 /**
@@ -282,6 +352,8 @@ function clearSource() {
   dom.sourceMetaText.textContent = "";
   refreshGenerateButton();
   refreshCostPreview();
+  refreshInterrogateButton();
+  refreshInterrogateNote();
 }
 
 function setSourcePreview(label, objectUrl) {
@@ -335,6 +407,8 @@ async function acceptFile(file) {
     dom.dropzone.classList.remove("is-disabled");
     refreshGenerateButton();
     refreshCostPreview();
+    refreshInterrogateButton();
+    refreshInterrogateNote();
   }
 }
 
@@ -360,6 +434,31 @@ function refreshModelNote() {
     return;
   }
   dom.modelNote.textContent = model.note || "";
+}
+
+function fillInterrogateModels() {
+  const models = state.interrogateModels;
+  dom.interrogateModelSelect.replaceChildren();
+  for (const model of models) {
+    const option = document.createElement("option");
+    option.value = model.id;
+    option.textContent = model.label;
+    dom.interrogateModelSelect.append(option);
+  }
+  if (models.length) {
+    const preferred = models.find((model) => model.id === state.interrogateDefaultModel);
+    dom.interrogateModelSelect.value = (preferred || models[0]).id;
+  }
+  refreshInterrogateModelNote();
+}
+
+function refreshInterrogateModelNote() {
+  const model = state.interrogateModels.find(
+    (entry) => entry.id === dom.interrogateModelSelect.value
+  );
+  dom.interrogateModelNote.textContent = model
+    ? model.note || ""
+    : "没有可用的反推模型。";
 }
 
 function fillSizeOptions() {
@@ -426,6 +525,8 @@ function setMode(mode) {
   fillChips();
   refreshGenerateButton();
   refreshCostPreview();
+  refreshInterrogateButton();
+  refreshInterrogateNote();
 }
 
 // -------------------------------------------------------------------- 生成
@@ -455,20 +556,18 @@ function previewRequest(request) {
   };
 }
 
-function openConfirm(quote, request) {
-  renderPairs(dom.confirmFacts, [
-    ["模型", quote.modelLabel],
-    ["方式", quote.mode === EDIT ? "在原图上改" : "凭空生成"],
-    ["成片张数", `${quote.count} 张`],
-    ["付费请求", `${quote.paidRequests} 次`],
-    ["画布尺寸", quote.imageSize || ""],
-    ["输入图", state.source ? state.source.filename : ""],
-    ["说明", quote.note],
-  ]);
+/**
+ * 费用确认弹窗只有一个，但底下能挂两种动作：出图和反推。两种都是真实付费
+ * 请求，所以共用同一条「报价 → 确认 → 才发出请求」的路径。
+ */
+function openConfirm(rows, action) {
+  renderPairs(dom.confirmFacts, rows);
+  dom.confirmWarning.textContent = action.warning;
+  dom.confirmAccept.textContent = action.acceptLabel;
   dom.confirmBackdrop.hidden = false;
   dom.confirmAccept.disabled = false;
   dom.confirmAccept.focus();
-  state.lastRequest = request;
+  state.pendingAction = action;
 }
 
 function closeConfirm() {
@@ -478,11 +577,29 @@ function closeConfirm() {
 async function requestQuote() {
   if (!canGenerate()) return;
   const request = buildRequestBody();
+  state.lastRequest = request;
   dom.generateButton.classList.add("is-busy");
   dom.generateButton.disabled = true;
   try {
     const quote = await api("/studio/quote", post(request));
-    openConfirm(quote, request);
+    openConfirm(
+      [
+        ["模型", quote.modelLabel],
+        ["方式", quote.mode === EDIT ? "在原图上改" : "凭空生成"],
+        ["成片张数", `${quote.count} 张`],
+        ["付费请求", `${quote.paidRequests} 次`],
+        ["画布尺寸", quote.imageSize || ""],
+        ["输入图", state.source ? state.source.filename : ""],
+        ["说明", quote.note],
+      ],
+      {
+        kind: "render",
+        acceptLabel: "确认并生成",
+        warning:
+          "点击「确认并生成」就会真的向 SiliconFlow 发起付费请求，" +
+          "费用计入你的硅基流动账单。取消则不会发出任何请求。",
+      }
+    );
   } catch (error) {
     showCostError(error.message);
   } finally {
@@ -584,6 +701,123 @@ async function runRender() {
   }
 }
 
+// -------------------------------------------------------------------- 反推
+
+async function requestInterrogateQuote() {
+  if (!canInterrogate()) return;
+  const request = {
+    sourceImageId: state.source.imageId,
+    modelId: dom.interrogateModelSelect.value || null,
+    focus: dom.interrogateFocus.value,
+    hint: "",
+  };
+  state.lastInterrogateRequest = request;
+  state.interrogating = true;
+  refreshInterrogateButton();
+  try {
+    const quote = await api("/studio/interrogate/quote", post(request));
+    openConfirm(
+      [
+        ["模型", quote.modelLabel],
+        ["方式", quote.focus === "style" ? "只取风格和色调" : "复刻这张画面"],
+        ["输入图", state.source.filename],
+        ["付费请求", `${quote.paidRequests} 次`],
+        ["说明", quote.note],
+      ],
+      {
+        kind: "interrogate",
+        acceptLabel: "确认并反推",
+        warning:
+          "点击「确认并反推」会把这张图发给视觉模型，并把画面内容写成文字返回；" +
+          "这是一次真实付费请求，费用计入你的硅基流动账单。取消则不会发出任何请求。",
+      }
+    );
+  } catch (error) {
+    dom.interrogateNote.textContent = `反推失败：${error.message}`;
+  } finally {
+    state.interrogating = false;
+    refreshInterrogateButton();
+  }
+}
+
+async function runInterrogate() {
+  const request = state.lastInterrogateRequest;
+  if (!request) return;
+  closeConfirm();
+  state.interrogating = true;
+  refreshInterrogateButton();
+  dom.resultHint.textContent = "正在反推";
+  const wrapper = document.createElement("div");
+  wrapper.append(
+    text("div", "", "spinner"),
+    text("p", "正在读图并写提示词，这是一次真实付费请求…", "empty-state")
+  );
+  showStage(wrapper);
+  dom.resultActions.hidden = true;
+  dom.resultFacts.hidden = true;
+
+  try {
+    const result = await api(
+      "/studio/interrogate",
+      post({ ...request, confirmPaid: true })
+    );
+    applyInterrogation(result);
+  } catch (error) {
+    dom.interrogateNote.textContent = `反推失败：${error.message}`;
+    showError(error.message);
+  } finally {
+    state.interrogating = false;
+    refreshInterrogateButton();
+  }
+}
+
+function applyInterrogation(result) {
+  dom.promptInput.value = result.prompt;
+  dom.negativeInput.value = result.negativePrompt || "";
+
+  dom.interrogateChips.replaceChildren();
+  const alternatives = result.alternatives || [];
+  dom.interrogateChips.hidden = alternatives.length === 0;
+  for (const alternative of alternatives) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "chip";
+    button.title = alternative;
+    button.textContent =
+      alternative.length > 24 ? `${alternative.slice(0, 24)}…` : alternative;
+    button.addEventListener("click", () => {
+      dom.promptInput.value = alternative;
+      refreshGenerateButton();
+      refreshCostPreview();
+      dom.promptInput.focus();
+    });
+    dom.interrogateChips.append(button);
+  }
+
+  // 反推结果也接进「拿回来改」那条路径：改完提示词再生成，不额外收费。
+  state.lastRequest = {
+    prompt: result.prompt,
+    negativePrompt: result.negativePrompt || "",
+    mode: state.mode,
+    modelId: dom.modelSelect.value,
+    count: Number(dom.countSelect.value || 1),
+  };
+  dom.interrogateNote.textContent =
+    `已用 ${result.modelLabel} 反推完成（1 次付费请求），提示词已填入。` +
+    "可以直接生成，也可以点下面的备选换一种说法。";
+  dom.resultHint.textContent = "反推完成";
+  showStage(
+    text(
+      "p",
+      "反推完成：提示词已经填进左边的输入框，改完直接点「生成」。",
+      "empty-state"
+    )
+  );
+  refreshGenerateButton();
+  refreshCostPreview();
+  dom.promptInput.focus();
+}
+
 function reuseLastRequest() {
   const request = state.lastRequest || (state.lastResult && state.lastResult.quote);
   if (!request) return;
@@ -655,6 +889,8 @@ async function loadStatus() {
     const status = await api("/studio/status");
     state.configured = Boolean(status.configured);
     state.models = status.models || [];
+    state.interrogateModels = status.interrogateModels || [];
+    state.interrogateDefaultModel = status.interrogateModel || "";
     state.maxRenders = status.maxRenders || FALLBACK_MAX_RENDERS;
     state.maxUploadMb = status.maxUploadMb || FALLBACK_MAX_UPLOAD_MB;
     dom.providerPill.classList.toggle("is-ok", state.configured);
@@ -668,6 +904,7 @@ async function loadStatus() {
     state.configured = false;
   }
   fillCountOptions();
+  fillInterrogateModels();
   setMode(EDIT);
 }
 
@@ -730,10 +967,14 @@ function wireControls() {
     refreshCostPreview();
   });
   dom.generateButton.addEventListener("click", requestQuote);
+  dom.interrogateButton.addEventListener("click", requestInterrogateQuote);
+  dom.interrogateModelSelect.addEventListener("change", refreshInterrogateModelNote);
   dom.confirmCancel.addEventListener("click", closeConfirm);
   dom.confirmAccept.addEventListener("click", () => {
     dom.confirmAccept.disabled = true;
-    runRender();
+    const action = state.pendingAction;
+    if (action && action.kind === "interrogate") runInterrogate();
+    else runRender();
   });
   dom.reuseButton.addEventListener("click", reuseLastRequest);
   dom.confirmBackdrop.addEventListener("click", (event) => {
@@ -750,6 +991,8 @@ function init() {
   wireControls();
   refreshGenerateButton();
   refreshCostPreview();
+  refreshInterrogateButton();
+  refreshInterrogateNote();
   loadStatus();
   loadHistory();
 }

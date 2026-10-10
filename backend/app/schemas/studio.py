@@ -69,9 +69,57 @@ class StudioStatus(BaseModel):
     default_edit_model: str = Field(alias="defaultEditModel")
     default_text_model: str = Field(alias="defaultTextModel")
     models: list[dict[str, Any]]
+    interrogate_models: list[dict[str, Any]] = Field(
+        default_factory=list, alias="interrogateModels"
+    )
+    interrogate_model: str = Field(default="", alias="interrogateModel")
     max_renders: int = Field(alias="maxRenders")
     max_upload_mb: int = Field(alias="maxUploadMb")
     note: str = ""
+
+
+class StudioInterrogateRequestBody(BaseModel):
+    """One reverse-prompt request: a photo in, a usable prompt out.
+
+    ``confirmPaid`` mirrors the render path: the interrogation is its own paid
+    request, and the server refuses to issue it for a caller that never saw the
+    price.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    source_image_id: str = Field(alias="sourceImageId")
+    model_id: str | None = Field(default=None, alias="modelId")
+    focus: Literal["replicate", "style"] = "replicate"
+    hint: str = ""
+    confirm_paid: bool = Field(default=False, alias="confirmPaid")
+
+
+class StudioInterrogateQuote(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    model: str
+    model_label: str = Field(alias="modelLabel")
+    focus: str
+    source_image_id: str = Field(alias="sourceImageId")
+    paid_requests: int = Field(alias="paidRequests")
+    requires_confirmation: bool = Field(default=True, alias="requiresConfirmation")
+    note: str = ""
+
+
+class StudioInterrogateResult(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    quote: StudioInterrogateQuote
+    prompt: str
+    negative_prompt: str = Field(default="", alias="negativePrompt")
+    alternatives: list[str] = Field(default_factory=list)
+    model: str
+    model_label: str = Field(alias="modelLabel")
+    focus: str
+    source_image_id: str = Field(alias="sourceImageId")
+    generated_at: str | None = Field(default=None, alias="generatedAt")
+    paid_requests: int = Field(alias="paidRequests")
 
 
 class StudioRenderResult(BaseModel):
