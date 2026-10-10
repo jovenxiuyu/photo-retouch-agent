@@ -10,11 +10,18 @@ There are two clearly separated design modes:
   triggered as a fallback: if the model fails, the request fails with 502
   instead of quietly returning templates as if they were AI designs.
 
-The full "AI design three looks" flow the UI runs is *two* billable vision
-calls: ``POST /photos/analyze`` first, then ``POST /styling/proposals``. The
-providers endpoint reports that honestly so the copy cannot under-count the
-cost; when the analysis cache still holds the same photo analysed by the same
-model, the first call is served from cache and the flow costs one request.
+The full "AI design three looks, then generate one" flow the UI runs is *three*
+billable model calls: ``POST /photos/analyze`` first, then
+``POST /styling/proposals`` for the design, and finally the ``brain.optimize``
+prompt-planning call inside ``POST /api/retouch/jobs`` when the chosen look is
+generated. The providers endpoint reports that honestly so the copy cannot
+under-count the cost; when the analysis cache still holds the same photo
+analysed by the same model, the first call is served from cache and the flow
+costs two requests.
+
+DeepSeek-class brains run with ``visionMode == "derived"``: they never receive
+the pixels, they design from the locally measured ``faceFacts`` only. The copy
+says so rather than implying the model looked at the photo.
 
 Generating a look still goes through ``POST /api/retouch/jobs`` with the chosen
 proposal posted as the plan and the *original* image id as ``sourceImageId``.
@@ -67,11 +74,17 @@ _REQUESTS_PER_GENERATION = 1
 _AI_DESIGN_REQUESTS = 1
 
 # The end-to-end "AI design three looks" flow the UI triggers also runs one
-# billable vision analysis first (``POST /photos/analyze``). Both calls are
-# real provider calls, so the UI must report ``2`` rather than the misleading
-# ``1`` that only counted the planner.
+# billable analysis first (``POST /photos/analyze``). Uploading the chosen look
+# to ``POST /api/retouch/jobs`` then runs the brain's ``optimize`` planning pass
+# before the image edit, which is a third real provider request.
 _AI_ANALYSIS_REQUESTS = 1
-_AI_FLOW_REQUESTS = _AI_ANALYSIS_REQUESTS + _AI_DESIGN_REQUESTS
+_AI_GENERATION_REQUESTS = 1
+_AI_FLOW_REQUESTS = (
+    _AI_ANALYSIS_REQUESTS + _AI_DESIGN_REQUESTS + _AI_GENERATION_REQUESTS
+)
+# With a cached analysis the analysis pass is free, but the design and the
+# generation-planning passes still bill.
+_AI_REUSED_ANALYSIS_REQUESTS = _AI_DESIGN_REQUESTS + _AI_GENERATION_REQUESTS
 
 
 @router.get("/providers")
@@ -103,29 +116,35 @@ def get_styling_providers(
                 "isAi": True,
                 "analysisRequests": _AI_ANALYSIS_REQUESTS,
                 "designRequests": _AI_DESIGN_REQUESTS,
+                "generationRequests": _AI_GENERATION_REQUESTS,
                 "paidRequests": _AI_FLOW_REQUESTS,
-                "reusedAnalysisRequests": _AI_DESIGN_REQUESTS,
+                "reusedAnalysisRequests": _AI_REUSED_ANALYSIS_REQUESTS,
                 "costNote": (
-                    "由所选视觉模型设计三套方案：本流程含 1 次人物视觉分析 + "
-                    f"1 次造型设计，共 {_AI_FLOW_REQUESTS} 次付费模型调用，只在"
-                    "你点击按钮时发起。若该照片已有同一模型的有效分析缓存，"
-                    f"分析会免费复用，本次只计 {_AI_DESIGN_REQUESTS} 次。"
+                    "由所选模型设计三套方案并出图：完整流程含 1 次人物事实分析 + "
+                    f"1 次造型设计 + 1 次出图提示词规划，共 {_AI_FLOW_REQUESTS} 次付费"
+                    "模型调用，只在你点击按钮时发起。无图像输入能力的模型（如 "
+                    "DeepSeek）不会看到原图，只依据本地程序测量的 FaceFacts 设计。"
+                    "若该照片已有同一模型的有效分析缓存，分析会免费复用，"
+                    f"本次只计 {_AI_REUSED_ANALYSIS_REQUESTS} 次。"
                 ),
             },
         },
         "stylingAiDesignRequests": _AI_DESIGN_REQUESTS,
         "stylingAiAnalysisRequests": _AI_ANALYSIS_REQUESTS,
+        "stylingAiGenerationRequests": _AI_GENERATION_REQUESTS,
         "stylingAiFlowRequests": _AI_FLOW_REQUESTS,
         "estimatedRequestsPerGeneration": _REQUESTS_PER_GENERATION,
         "billingNote": (
-            "Template proposals are free (no model calls). The AI design flow is "
-            f"two paid vision calls: 1 analysis (POST /photos/analyze) + 1 styling "
-            f"design (POST /styling/proposals) = {_AI_FLOW_REQUESTS} requests, and "
-            "only runs when you press the design button. A valid cached analysis "
-            "for the same photo and model is reused for free, dropping the flow to "
-            f"{_AI_DESIGN_REQUESTS} request. Generating one look costs "
-            f"{_REQUESTS_PER_GENERATION} image-edit request and only runs when you "
-            "press a generate button."
+            "Template proposals are free (no model calls). The full AI flow is "
+            f"three paid model calls: 1 analysis (POST /photos/analyze) + 1 styling "
+            f"design (POST /styling/proposals) + 1 prompt planning inside "
+            f"POST /retouch/jobs = {_AI_FLOW_REQUESTS} requests, and only runs when "
+            "you press the design and generate buttons. Brains without image input "
+            '(visionMode "derived", e.g. DeepSeek) design from locally measured '
+            "FaceFacts and never see the photo. A valid cached analysis for the same "
+            "photo and model is reused for free, dropping the flow to "
+            f"{_AI_REUSED_ANALYSIS_REQUESTS} requests. Generating one look costs "
+            f"{_REQUESTS_PER_GENERATION} image-edit request."
         ),
     }
 

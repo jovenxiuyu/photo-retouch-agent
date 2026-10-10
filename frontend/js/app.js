@@ -514,11 +514,13 @@ function updateStylingCostNote() {
     selectedCount: 1,
     mode,
     analysisReused: analysisReused(),
+    brainIsPaid: Boolean(selectedProvider("brain")?.requiresApiKey),
   });
   const selected = selectedStylingProposal();
+  const vision = mode === "ai" ? ` ${cost.visionNote}` : "";
   elements.stylingCostNote.textContent = selected
-    ? `已选「${selected.name || selected.planId}」：${cost.note} 未点击生成前不会产生任何请求。`
-    : cost.note;
+    ? `已选「${selected.name || selected.planId}」：${cost.note}${vision} 未点击生成前不会产生任何请求。`
+    : `${cost.note}${vision}`;
 }
 
 
@@ -534,12 +536,15 @@ function confirmPaidStylingDesign() {
   const brain = selectedProvider("brain");
   if (brain && !brain.requiresApiKey) return true;
   const reused = analysisReused();
-  const calls = reused ? 1 : 2;
+  const calls = reused ? 2 : 3;
   const label = brain?.label || brain?.id || "付费视觉模型";
   const approved = window.confirm(
-    `「AI 设计三套造型」会调用付费视觉模型「${label}」，最多 ${calls} 次付费请求` +
-      (reused ? "（已有可复用的人物分析缓存，本次只计 1 次）" : "（1 次人物视觉分析 + 1 次造型设计）") +
-      "。\n\n只有你现在点击「确定」才会提交，本轮不会自动重试。是否继续？",
+    `「AI 设计三套造型」会调用付费模型「${label}」，完整流程最多 ${calls} 次付费请求` +
+      (reused
+        ? "（已有可复用的人物分析缓存，本次为 1 次造型设计 + 1 次出图提示词规划）"
+        : "（1 次人物事实分析 + 1 次造型设计 + 1 次出图提示词规划）") +
+      "。\n无图像输入能力的模型（如 DeepSeek）不会看到原图，只依据本地程序测量的 FaceFacts 设计。" +
+      "\n\n只有你现在点击「确定」才会提交，本轮不会自动重试。是否继续？",
   );
   if (approved) return true;
   elements.stylingFeedback.textContent =
@@ -629,7 +634,7 @@ async function designStylingFlow(mode = "template") {
   setStylingBusy(true);
   elements.stylingFeedback.textContent = isAi
     ? brainIsPaid
-      ? "正在调用 AI 设计三套造型（最多 2 次付费模型调用：1 次人物视觉分析 + 1 次造型设计；已有可用分析缓存时只计 1 次）。"
+      ? "正在调用 AI 设计三套造型（完整流程最多 3 次付费模型调用：1 次人物事实分析 + 1 次造型设计 + 1 次出图提示词规划；已有可用分析缓存时只计 2 次。该模型不看原图，只依据本地 FaceFacts 设计）。"
       : "正在用本地规则模型设计三套造型（0 次付费模型调用，不产生任何费用）。"
     : "正在使用免费模板组合生成三套造型预览（0 次模型调用，不产生任何费用）。";
   elements.stylingFeedback.className = "ai-feedback";
@@ -670,9 +675,9 @@ async function designStylingFlow(mode = "template") {
       ? brainIsPaid
         ? `AI 个性化设计完成 ${result.proposals.length} 套造型（${
             result.analysisReused
-              ? "复用已有分析缓存，本次 1 次付费模型调用"
-              : "2 次付费模型调用：1 次人物视觉分析 + 1 次造型设计"
-          }），选择一套再生成图片。`
+              ? "复用已有分析缓存，本流程共 2 次付费模型调用：1 次造型设计 + 1 次出图提示词规划"
+              : "完整流程 3 次付费模型调用：1 次人物事实分析 + 1 次造型设计 + 1 次出图提示词规划"
+          }；该模型不看原图，只依据本地 FaceFacts 设计），选择一套再生成图片。`
         : `AI 个性化设计完成 ${result.proposals.length} 套造型（本地规则模型，0 次付费模型调用），选择一套再生成图片。`
       : `已生成 ${result.proposals.length} 套免费模板预览（0 次模型调用），选择一套再生成图片。`;
     elements.stylingFeedback.className = "ai-feedback success";
@@ -902,6 +907,7 @@ function openCostDialog(planId) {
     selectedCount: 1,
     mode: stylingDesignMode(),
     analysisReused: analysisReused(),
+    brainIsPaid: Boolean(selectedProvider("brain")?.requiresApiKey),
   });
   const designRequests = cost.paidDesignRequests;
   const localSim = actionIsLocalSimulation();
@@ -931,7 +937,7 @@ function openCostDialog(planId) {
     } else if (designRequests > 0) {
       elements.costDesignValue.textContent = analysisReused()
         ? `${designRequests} 次（复用分析缓存，仅 1 次造型设计）`
-        : `${designRequests} 次（1 次人物视觉分析 + 1 次造型设计）`;
+        : `${designRequests} 次（1 次人物事实分析 + 1 次造型设计）`;
     } else {
       elements.costDesignValue.textContent = "0 次";
     }
@@ -944,7 +950,9 @@ function openCostDialog(planId) {
   if (elements.costImageValue) {
     elements.costImageValue.textContent = localSim
       ? `0 次付费（本地模拟 ${cost.requestsPerLook} 次）`
-      : `${cost.requestsPerLook} 次付费请求`;
+      : isAi
+        ? `${cost.requestsPerLook} 次付费请求（另含 1 次出图提示词规划）`
+        : `${cost.requestsPerLook} 次付费请求`;
   }
   if (elements.costJobCount) {
     elements.costJobCount.textContent = localSim
@@ -952,9 +960,17 @@ function openCostDialog(planId) {
       : "1 个付费任务";
   }
   if (elements.costDialogNote) {
+    const flowNote =
+      isAi && brainIsPaid
+        ? `完整流程最多 ${cost.paidFlowRequests} 次付费模型调用（${
+            analysisReused()
+              ? "复用分析缓存：1 次造型设计 + 1 次出图提示词规划"
+              : "1 次人物事实分析 + 1 次造型设计 + 1 次出图提示词规划"
+          }）。${cost.visionNote}`
+        : "";
     elements.costDialogNote.textContent = localSim
-      ? `本地模拟只用于验证流程，不调用 ${actionLabel}，也不产生费用。`
-      : `服务商：${actionLabel} · 出图只对选中的这一套发起 ${cost.requestsPerLook} 次图像编辑请求，费用以 ${actionLabel} 实际计费为准。`;
+      ? `本地模拟只用于验证流程，不调用 ${actionLabel}，也不产生费用。${flowNote}`
+      : `服务商：${actionLabel} · 出图只对选中的这一套发起 ${cost.requestsPerLook} 次图像编辑请求，费用以 ${actionLabel} 实际计费为准。${flowNote}`;
   }
 
   const dialog = elements.costDialog;
@@ -1248,11 +1264,13 @@ async function loadStylingVocabulary() {
       { selectedCount: 1, mode: "ai" },
     );
     if (elements.stylingCostNote) {
-      const flowRequests = Number(info.stylingAiFlowRequests ?? cost.paidDesignRequests) || 2;
+      const flowRequests = Number(info.stylingAiFlowRequests ?? cost.paidFlowRequests) || 3;
       const designRequests =
         Number(info.stylingAiDesignRequests ?? cost.designRequests) || 1;
+      const generationRequests =
+        Number(info.stylingAiGenerationRequests ?? cost.generationRequests) || 1;
       elements.stylingCostNote.textContent =
-        `AI 个性化设计：含 1 次人物视觉分析 + 1 次造型设计，共 ${flowRequests} 次付费模型调用；该照片已有有效分析缓存时复用分析，只计 ${designRequests} 次。免费模板预览 0 次调用。出图只对选中的一套发起 ${cost.requestsPerLook} 次图像编辑请求。`;
+        `AI 个性化设计：完整流程含 1 次人物事实分析 + 1 次造型设计 + ${generationRequests} 次出图提示词规划，共 ${flowRequests} 次付费模型调用；该照片已有有效分析缓存时复用分析，只计 ${designRequests + generationRequests} 次。无图像输入能力的模型（如 DeepSeek）不会看到原图，只依据本地程序测量的 FaceFacts 设计，并未直接做视觉看图分析。免费模板预览 0 次调用。出图只对选中的一套发起 ${cost.requestsPerLook} 次图像编辑请求。`;
     }
   } catch (error) {
     elements.stylingSource.textContent = "风格库状态读取失败";

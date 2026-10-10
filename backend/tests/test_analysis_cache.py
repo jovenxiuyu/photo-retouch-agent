@@ -282,27 +282,35 @@ def test_analyze_endpoint_reuses_a_cached_analysis_for_the_same_bytes(
     assert body["domainType"] == "portrait"
 
 
-def test_styling_providers_report_the_full_two_call_design_flow(
+def test_styling_providers_report_the_full_three_call_design_flow(
     client: TestClient,
 ) -> None:
     body = client.get("/api/styling/providers").json()
 
     assert body["stylingAiAnalysisRequests"] == 1
     assert body["stylingAiDesignRequests"] == 1
-    assert body["stylingAiFlowRequests"] == 2
+    assert body["stylingAiGenerationRequests"] == 1
+    assert body["stylingAiFlowRequests"] == 3
 
     ai_mode = body["stylingDesignModes"]["ai"]
     assert ai_mode["analysisRequests"] == 1
     assert ai_mode["designRequests"] == 1
-    assert ai_mode["paidRequests"] == 2
-    assert "1 次人物视觉分析" in ai_mode["costNote"]
-    assert "2 次付费模型调用" in ai_mode["costNote"]
+    assert ai_mode["generationRequests"] == 1
+    # The whole flow (analysis + design + generation planning) is three calls,
+    # and the cached-analysis path still bills the design and planning passes.
+    assert ai_mode["paidRequests"] == 3
+    assert ai_mode["reusedAnalysisRequests"] == 2
+    assert "1 次人物事实分析" in ai_mode["costNote"]
+    assert "3 次付费模型调用" in ai_mode["costNote"]
+    # The copy must not imply the text-only model looked at the photo.
+    assert "不会看到原图" in ai_mode["costNote"]
 
     template_mode = body["stylingDesignModes"]["template"]
     assert template_mode["paidRequests"] == 0
 
     # The English billing note must agree with the Chinese copy.
-    assert "2 requests" in body["billingNote"]
+    assert "3 requests" in body["billingNote"]
+    assert "never see the photo" in body["billingNote"]
     assert "free" in body["billingNote"]
 
 

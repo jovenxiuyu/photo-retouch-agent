@@ -96,13 +96,29 @@ _RESPONSE_CONTRACT: dict[str, Any] = {
     ]
 }
 
-_SYSTEM_PROMPT = (
+# The prompt differs by transport: a "direct" brain is handed the pixels and may
+# describe them, while a "derived" brain (DeepSeek and other text-only models)
+# only ever receives locally measured facts and must never claim to have seen
+# the photo.
+_SYSTEM_PROMPT_HEAD_VISION = (
     "你是「AI Beauty Style Lab」的资深整体形象设计总监（AI Stylist）。"
     "你会看到一位真人的照片、由本地程序测量得到的可见外形事实（faceFacts），"
     "以及一份可用的风格库预设清单（stylePresetCatalogue）。"
     "请为这一个人设计三套完整、彼此差异明显的整体形象改造方案。\n"
+)
+
+_SYSTEM_PROMPT_HEAD_DERIVED = (
+    "你是「AI Beauty Style Lab」的资深整体形象设计总监（AI Stylist）。"
+    "重要：你并没有看到这位真人的原图（本次没有图像输入）。"
+    "你只会收到由本地程序测量得到的可见外形事实（faceFacts）"
+    "以及一份可用的风格库预设清单（stylePresetCatalogue）。"
+    "请只依据这些结构化事实，为这一个人设计三套完整、彼此差异明显的整体形象改造方案，"
+    "不要描述任何照片细节，也不要声称自己看过照片。\n"
+)
+
+_SYSTEM_PROMPT_RULES = (
     "硬性要求：\n"
-    "1. 只依据照片中可观察到的视觉信息与给定的 faceFacts 判断；"
+    "1. 只依据给定的可观察视觉信息与 faceFacts 判断；"
     "绝不推断或描述人物的性别、年龄、职业、性格、民族、宗教信仰等无法从照片确认的属性。\n"
     "2. 三套方案必须在发型、发色、妆容、服装搭配上有实质区别，"
     "不能只是换三个形容词，也不要是同一种造型的三个变体。\n"
@@ -114,6 +130,15 @@ _SYSTEM_PROMPT = (
     "5. 保脸是尽力而为，绝不承诺百分之百保脸，也不要声称能保证身份完全不变。\n"
     "6. 只返回一个 JSON 对象，字段严格符合 requiredResponse 的结构，不要输出任何多余文字。"
 )
+
+
+def _styling_system_prompt(vision_mode: str) -> str:
+    head = (
+        _SYSTEM_PROMPT_HEAD_VISION
+        if vision_mode == "direct"
+        else _SYSTEM_PROMPT_HEAD_DERIVED
+    )
+    return head + _SYSTEM_PROMPT_RULES
 
 
 class AIStylingPlanner(OpenAICompatiblePromptBrain):
@@ -136,9 +161,10 @@ class AIStylingPlanner(OpenAICompatiblePromptBrain):
             identity_anchors=identity_anchors,
             user_instruction=user_instruction,
             analysis_summary=analysis_summary or {},
+            vision_mode=self.vision_mode,
         )
         content = await self._complete(
-            _SYSTEM_PROMPT,
+            _styling_system_prompt(self.vision_mode),
             user_text,
             image_path if self.vision_mode == "direct" else None,
             temperature=0.7,
@@ -154,6 +180,7 @@ class AIStylingPlanner(OpenAICompatiblePromptBrain):
         identity_anchors: tuple[str, ...],
         user_instruction: str,
         analysis_summary: dict[str, Any],
+        vision_mode: str = "derived",
     ) -> str:
         catalogue = {
             bucket: [
@@ -172,8 +199,14 @@ class AIStylingPlanner(OpenAICompatiblePromptBrain):
             {
                 "task": (
                     "为照片里的这个人设计三套完整形象改造方案。"
-                    "直接观察随消息提供的原图（若提供），结合 faceFacts 做设计判断。"
+                    + (
+                        "直接观察随消息提供的原图（若提供），结合 faceFacts 做设计判断。"
+                        if vision_mode == "direct"
+                        else "本次没有图像输入：请只依据本地程序测量的 faceFacts "
+                        "与结构化分析做设计，不要声称自己看过原图。"
+                    )
                 ),
+                "visionMode": vision_mode,
                 "faceFacts": face_facts,
                 "analysisSummary": analysis_summary,
                 "identityAnchorsToKeep": list(identity_anchors),

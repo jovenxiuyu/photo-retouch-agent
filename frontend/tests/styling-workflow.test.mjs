@@ -87,18 +87,27 @@ test("estimateStylingCost separates free template preview from the AI design flo
   assert.equal(template.designMode, "template");
   assert.equal(template.analysisRequests, 0);
   assert.equal(template.designRequests, 0);
+  assert.equal(template.generationRequests, 0);
   assert.equal(template.paidDesignRequests, 0);
+  assert.equal(template.paidFlowRequests, 0);
   assert.match(template.note, /免费生成/);
 
   const ai = estimateStylingCost(THREE_LOOKS, { selectedCount: 1, mode: "ai" });
   assert.equal(ai.designMode, "ai");
   assert.equal(ai.analysisRequests, 1);
   assert.equal(ai.designRequests, 1);
-  // The button triggers two billable vision calls, not one.
+  // Generating the chosen look also bills one prompt-planning pass, so the
+  // complete flow is three paid calls, not the two that only counted design.
+  assert.equal(ai.generationRequests, 1);
   assert.equal(ai.paidDesignRequests, 2);
+  assert.equal(ai.paidFlowRequests, 3);
   assert.equal(ai.analysisReused, false);
-  assert.match(ai.note, /2 次付费模型调用/);
-  assert.match(ai.note, /1 次人物视觉分析/);
+  assert.match(ai.note, /3 次付费模型调用/);
+  assert.match(ai.note, /1 次人物事实分析/);
+  // A text-only brain must be labelled as never seeing the photo.
+  assert.equal(ai.visionDerived, true);
+  assert.match(ai.visionNote, /FaceFacts/);
+  assert.match(ai.visionNote, /并未直接/);
   // Generation cost is tracked separately: one look, one image edit.
   assert.equal(ai.totalRequests, 1);
 });
@@ -112,10 +121,11 @@ test("estimateStylingCost counts a reused analysis as free", () => {
   assert.equal(ai.analysisReused, true);
   assert.equal(ai.analysisRequests, 1);
   assert.equal(ai.designRequests, 1);
-  // The analysis was served from cache, so only the design is billed.
+  // The analysis was served from cache, so only design + planning are billed.
   assert.equal(ai.paidDesignRequests, 1);
+  assert.equal(ai.paidFlowRequests, 2);
   assert.match(ai.note, /复用/);
-  assert.match(ai.note, /1 次付费模型调用/);
+  assert.match(ai.note, /2 次付费模型调用/);
 });
 
 test("designStyling forwards the design mode and user text, and never mislabels templates as AI", async () => {
@@ -187,6 +197,7 @@ test("designStyling surfaces a cached analysis so the caller can report one paid
     analysisReused: result.analysisReused,
   });
   assert.equal(cost.paidDesignRequests, 1);
+  assert.equal(cost.paidFlowRequests, 2);
 });
 
 test("designs three looks, then generates only the selected look from the original", async () => {
